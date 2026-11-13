@@ -38,6 +38,25 @@ class Night:
 
 
 @dataclass
+class RoomDetail:
+    number: int
+    name: str
+    adults: int = 0
+    children: int = 0
+    infants: int = 0
+    night_rates: list[Night] = field(default_factory=list)
+    stated_total: Decimal | None = None
+
+    @property
+    def total(self) -> Decimal:
+        return sum((n.net for n in self.night_rates), Decimal("0"))
+
+    @property
+    def first_night(self) -> Decimal | None:
+        return self.night_rates[0].net if self.night_rates else None
+
+
+@dataclass
 class AdditionalService:
     name: str
     quantity: int
@@ -69,11 +88,16 @@ class Booking:
     room: str = ""
     meal_plan: str = ""
     rate: str = ""
+    cancellation_policy: str = ""
     promotion: str = ""
     comments: str = ""
     benefits: list[str] = field(default_factory=list)
     terms: str = ""
     night_rates: list[Night] = field(default_factory=list)
+    rooms: list[RoomDetail] = field(default_factory=list)
+    deposit_required: Decimal | None = None
+    flexible_rate: bool = False
+    deposit_tax_included_verified: bool = False
     additional_services: list[AdditionalService] = field(default_factory=list)
     room_total: Decimal = Decimal("0")
     services_total: Decimal = Decimal("0")
@@ -131,6 +155,14 @@ def parse_paraty_eml(data: bytes) -> Booking:
         ("rate", "Rate"), ("promotion", "Promotion"),
     ]:
         setattr(r, key, field_value(soup, lab))
+    # En Paraty, la política de cancelación flexible aparece en un <span>
+    # inmediatamente después de <b>Cancellation policy:</b>.
+    cp_label = soup.find(["b", "strong"], string=lambda t: t and "Cancellation policy" in t)
+    if cp_label:
+        for next_node in cp_label.next_siblings:
+            if getattr(next_node, "name", None) == "span":
+                r.cancellation_policy = next_node.get_text(" ", strip=True)
+                break
     r.location = field_value(soup, "Address").lstrip(": ").strip()
     r.total = money(field_value(soup, "Total price"))
     # En Paraty «Pending payment» es texto del <span>, no una etiqueta <b>.
@@ -151,9 +183,21 @@ def parse_paraty_eml(data: bytes) -> Booking:
         r.nights = (datetime.fromisoformat(r.checkout) - datetime.fromisoformat(r.checkin)).days
     r.adults = int((re.search(r"(\d+)\s+Adults", soup.get_text(" ", strip=True)) or [None, 0])[1])
     r.children = int((re.search(r"(\d+)\s+Children", soup.get_text(" ", strip=True)) or [None, 0])[1])
-    # En el correo Paraty la tabla de tarifas tiene una subtabla por fecha.
-    old = soup.select_one(".old_price_per_day_table > table")
-    if old:
+    # Cada habitación es una tabla independiente. Paraty puede enviar 1 a 4
+    # (o más) tablas dentro del mismo bloque. Nunca interpretar solo la primera.
+    for index, old in enumerate(soup.select(".old_price_per_day_table > table"), start=1):
+        title_cell = old.select_one("tr > td > b")
+        title = title_cell.get_text(" ", strip=True) if title_cell else ""
+        meta = re.search(r"Room\s*(\d+)\s*:\s*(.*?)\s*\((\d+)-(\d+)-(\d+)\)", title, re.I)
+        if meta:
+            number = int(meta.group(1))
+            room = RoomDetail(number, meta.group(2).strip(), int(meta.group(3)),
+                              int(meta.group(4)), int(meta.group(5)))
+        else:
+            name = re.sub(r"^Room\s*\d+\s*:\s*", "", title, flags=re.I).strip()
+            room = RoomDetail(index, name or r.room or "Habitación no identificada")
+            r.warnings.append(f"Revisar categoría u ocupación de la habitación {index}")
+
         outer_rows = old.find_all("tr", recursive=False)
         if len(outer_rows) >= 2:
             for col in outer_rows[1].find_all("td", recursive=False):
@@ -166,9 +210,19 @@ def parse_paraty_eml(data: bytes) -> Booking:
                 date_str = trs[0].get_text(" ", strip=True)
                 amounts = re.findall(r"-?\s*\d+(?:[.,]\d+)?\s*USD", trs[1].get_text(" ", strip=True), re.I)
                 if len(amounts) >= 3:
-                    r.night_rates.append(Night(
+                    room.night_rates.append(Night(
                         date_str, money(amounts[0]), abs(money(amounts[1])), money(amounts[2])
                     ))
+        total_text = outer_rows[-1].get_text(" ", strip=True) if outer_rows else ""
+        total_hit = re.search(r"\bTotal\s*:\s*([\d,.]+)", total_text, re.I)
+        if total_hit:
+            room.stated_total = money(total_hit.group(1))
+        r.rooms.append(room)
+        r.night_rates.extend(room.night_rates)  # Compatibilidad con uso anterior.
+
+    if r.rooms:
+        r.adults = sum(x.adults for x in r.rooms)
+        r.children = sum(x.children for x in r.rooms)
     # Paraty añade estos servicios fuera de la tabla de tarifas por noche.
     # "Price" es el importe mostrado para la línea, no se vuelve a multiplicar
     # por Quantity porque el correo no afirma que sea tarifa unitaria.
@@ -197,12 +251,37 @@ def parse_paraty_eml(data: bytes) -> Booking:
             currency=currency,
         ))
 
-    r.room_total = sum((x.net for x in r.night_rates), Decimal("0"))
+    r.room_total = sum((room.total for room in r.rooms), Decimal("0"))
     r.services_total = sum((x.price for x in r.additional_services), Decimal("0"))
     r.extra_difference = r.total - r.room_total - r.services_total if r.night_rates else Decimal("0")
     if r.additional_services and r.tax_rate is not None:
         expected_tax = (r.services_total * r.tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         r.extra_tax_inferred = abs(r.extra_difference - expected_tax) <= Decimal("0.02")
+
+    # Para FLEXIBLE RATE, el anticipo es una noche POR HABITACIÓN, IVA/impuestos
+    # incluidos en la tarifa neta nocturna informada por Paraty, sin prorratear el
+    # total de la estancia (las tarifas por día pueden ser diferentes).
+    r.flexible_rate = bool(re.search(r"\bFLEXIBLE\b", r.rate or "", re.I))
+    if r.flexible_rate:
+        incomplete = [room.number for room in r.rooms if not room.night_rates or
+                      (r.nights and len(room.night_rates) != r.nights)]
+        if not r.rooms or incomplete:
+            r.warnings.append("No se puede calcular automáticamente el depósito flexible: "
+                              "falta desglose completo por habitación. Revisar Paraty.")
+        else:
+            r.deposit_required = sum((room.first_night for room in r.rooms), Decimal("0"))
+            # El subtotal de noches corresponde al total con impuestos cuando
+            # concilia con el importe final de Paraty. Un centavo puede diferir
+            # por redondeo del motor de reservas.
+            r.deposit_tax_included_verified = (
+                abs(r.room_total - r.total) <= Decimal("0.02")
+                if not r.additional_services else (
+                    abs(r.extra_difference) <= Decimal("0.02") or r.extra_tax_inferred
+                )
+            )
+            if not r.deposit_tax_included_verified:
+                r.warnings.append("El impuesto incluido en el anticipo no pudo verificarse "
+                                  "por conciliación; revisar antes de cobrar.")
 
     # Beneficios: lista bajo el bloque de Comments (no añadir políticas como beneficios).
     for ul in soup.find_all("ul"):
@@ -230,8 +309,16 @@ def parse_paraty_eml(data: bytes) -> Booking:
         r.warnings.append("La suma de tarifas por noche no coincide con el importe total")
     elif r.night_rates and r.additional_services and abs(r.extra_difference) > Decimal("0.02") and not r.extra_tax_inferred:
         r.warnings.append("El total de habitación más servicios no concilia exactamente con el total Paraty; revisar diferencia antes de generar el Word")
-    if r.nights and r.night_rates and len(r.night_rates) != r.nights:
-        r.warnings.append("El número de desglose de noches no coincide con la estancia")
+    if r.nights:
+        for room in r.rooms:
+            if len(room.night_rates) != r.nights:
+                r.warnings.append(f"La habitación {room.number} tiene {len(room.night_rates)} "
+                                  f"noches desglosadas; se esperaban {r.nights}.")
+    if len(r.rooms) > 4:
+        r.warnings.append("Se detectaron más de cuatro habitaciones: revisar que el documento se imprima completo.")
+    for room in r.rooms:
+        if room.stated_total is not None and abs(room.stated_total - room.total) > Decimal("0.02"):
+            r.warnings.append(f"El subtotal de la habitación {room.number} no concilia con Paraty.")
     return r
 
 
@@ -344,22 +431,40 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
         para(q, "Taxes per stay: ", True)
         para(q, fmt_usd(r.taxes))
         q = left.add_paragraph()
-        para(q, "Pending payment: ", True, color=(200, 30, 30), size=11)
-        para(q, fmt_usd(r.pending), True, color=(200, 30, 30), size=11)
+        if r.deposit_required is not None:
+            para(q, "Total pendiente según Paraty (NO es el depósito): ", True, size=9)
+            para(q, fmt_usd(r.pending), size=9)
+        else:
+            para(q, "Pending payment: ", True, color=(200, 30, 30), size=11)
+            para(q, fmt_usd(r.pending), True, color=(200, 30, 30), size=11)
+        if r.deposit_required is not None:
+            q = left.add_paragraph()
+            para(q, f"Depósito requerido (1 noche × {len(r.rooms)} habitaciones): ",
+                 True, color=(200, 30, 30), size=10)
+            para(q, fmt_usd(r.deposit_required), True, color=(200, 30, 30), size=10)
         if card_type == "American Express" and tc is not None:
             mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             q = left.add_paragraph()
             para(q, "MXN $" + f"{mxn:,.2f}" + "     tc " + format(tc, "f"), True,
                  color=(200, 30, 30), size=11)
+            if r.deposit_required is not None:
+                dep_mxn = (r.deposit_required * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                q = left.add_paragraph()
+                para(q, f"Depósito MXN ${dep_mxn:,.2f} (tc {tc})", True,
+                     color=(30, 75, 130), size=9)
         q = left.add_paragraph()
         para(q, f"Number of Nights: {r.nights}\nCheck-In Date: {fmt_date(r.checkin)}\nCheck-Out Date: {fmt_date(r.checkout)}")
         q = left.add_paragraph()
         para(q, "Rooms", True, size=10)
         q = left.add_paragraph()
-        para(q, f"Room 1: {r.adults} Adults, {r.children} Children", size=8)
+        for room in r.rooms:
+            q = left.add_paragraph()
+            para(q, f"Room {room.number}: {room.name} ({room.adults} Adults, "
+                    f"{room.children} Children)", size=8)
         for label, val in [
             ("Room Selected", r.room), ("Selected Board Plan", r.meal_plan),
             ("Rate", r.rate), ("Promotion", r.promotion),
+            ("Cancellation policy", r.cancellation_policy),
             ("Additional information of interest", r.requirements),
         ]:
             if val:
@@ -396,32 +501,61 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
         para(p, "Taxes per stay: ", True)
         para(p, fmt_usd(r.taxes))
         p = d.add_paragraph()
-        para(p, "Pending payment: ", True, color=(200, 30, 30), size=11)
-        para(p, fmt_usd(r.pending), True, color=(200, 30, 30), size=11)
+        if r.deposit_required is not None:
+            para(p, "Total pendiente según Paraty (NO es el depósito): ", True, size=9)
+            para(p, fmt_usd(r.pending), size=9)
+        else:
+            para(p, "Pending payment: ", True, color=(200, 30, 30), size=11)
+            para(p, fmt_usd(r.pending), True, color=(200, 30, 30), size=11)
+        if r.deposit_required is not None:
+            p = d.add_paragraph()
+            para(p, f"Depósito requerido (1 noche × {len(r.rooms)} habitaciones): ",
+                 True, color=(200, 30, 30), size=10)
+            para(p, fmt_usd(r.deposit_required), True, color=(200, 30, 30), size=10)
         if card_type == "American Express" and tc is not None:
             mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             p = d.add_paragraph()
             para(p, "MXN $" + f"{mxn:,.2f}" + "     tc " + format(tc, "f"), True,
                  color=(200, 30, 30), size=11)
+            if r.deposit_required is not None:
+                dep_mxn = (r.deposit_required * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                p = d.add_paragraph()
+                para(p, f"Depósito MXN ${dep_mxn:,.2f} (tc {tc})", True,
+                     color=(30, 75, 130), size=9)
 
     d.add_paragraph()
-    if r.night_rates:
-        p = d.add_paragraph()
-        para(p, "Room 1: " + r.room + f" ({r.adults}-{r.children}-0)", True)
-        # Fecha | Precio | Descuento | Neto, una fila por noche; legible con n noches variables.
-        tab = d.add_table(rows=1, cols=4)
-        tab.style = "Table Grid"
-        tab.alignment = WD_TABLE_ALIGNMENT.CENTER
-        for cell, title in zip(tab.rows[0].cells, ["Fecha", "Tarifa", "Descuento", "Total noche"]):
-            set_cell_shading(cell, "2261A8")
-            para(cell.paragraphs[0], title, True, color=(255,255,255), size=8)
-        for night in r.night_rates:
-            cells = tab.add_row().cells
-            for cell, content in zip(cells, [night.date, fmt_usd(night.original), "-" + fmt_usd(night.discount), fmt_usd(night.net)]):
-                para(cell.paragraphs[0], content, size=8)
-        p = d.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        para(p, "Subtotal habitación: " + fmt_usd(r.room_total), True)
+    if r.rooms:
+        # Una tabla compacta por habitación preserva el detalle de tarifa
+        # y el primer día (base del depósito) incluso con cuatro habitaciones.
+        for room in r.rooms:
+            p = d.add_paragraph()
+            p.paragraph_format.space_after = Pt(1)
+            para(p, f"Room {room.number}: {room.name} ({room.adults}-{room.children}-{room.infants})", True, size=9)
+            tab = d.add_table(rows=1, cols=4)
+            tab.style = "Table Grid"
+            tab.alignment = WD_TABLE_ALIGNMENT.CENTER
+            for cell, title in zip(tab.rows[0].cells, ["Fecha", "Tarifa", "Descuento", "Total noche"]):
+                set_cell_shading(cell, "2261A8")
+                para(cell.paragraphs[0], title, True, color=(255,255,255), size=8)
+            for night in room.night_rates:
+                cells = tab.add_row().cells
+                for cell, content in zip(cells, [night.date, fmt_usd(night.original),
+                                                "-" + fmt_usd(night.discount), fmt_usd(night.net)]):
+                    para(cell.paragraphs[0], content, size=8)
+            p = d.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            p.paragraph_format.space_after = Pt(1)
+            para(p, f"Subtotal habitación {room.number}: " + fmt_usd(room.total), True, size=8)
+        if len(r.rooms) > 1:
+            p = d.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            para(p, "Subtotal todas las habitaciones: " + fmt_usd(r.room_total), True, size=9)
+        if r.deposit_required is not None:
+            p = d.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            para(p, "DEPÓSITO FLEXIBLE: " + fmt_usd(r.deposit_required) +
+                 f"  (primera noche de cada una de {len(r.rooms)} habitaciones)", True,
+                 color=(30, 75, 130), size=9)
 
     if r.additional_services:
         p = d.add_paragraph()
@@ -456,10 +590,13 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
     if not payment_image:
         p = d.add_paragraph()
         para(p, "Rooms", True, size=10)
-        d.add_paragraph(f"Room 1: {r.adults} Adults, {r.children} Children")
+        for room in r.rooms:
+            d.add_paragraph(f"Room {room.number}: {room.name} "
+                            f"({room.adults} Adults, {room.children} Children)")
         for label, val in [
             ("Room Selected", r.room), ("Selected Board Plan", r.meal_plan),
             ("Rate", r.rate), ("Promotion", r.promotion),
+            ("Cancellation policy", r.cancellation_policy),
             ("Additional information of interest", r.requirements),
         ]:
             if val:
@@ -518,15 +655,26 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
     image_column = f'<div class="payment-image">{img_html}{payment_label}</div>'
 
     room_rates_html = ""
-    if r.night_rates:
-        rows = "".join(
-            f'<tr><td>{p_text(x.date)}</td><td>{p_text(fmt_usd(x.original))}</td>'
-            f'<td>-{p_text(fmt_usd(x.discount))}</td><td>{p_text(fmt_usd(x.net))}</td></tr>'
-            for x in r.night_rates
-        )
-        room_rates_html = f"""<h3>Room 1: {p_text(r.room)} ({r.adults}-{r.children}-0)</h3>
-          <table><thead><tr><th>Fecha</th><th>Tarifa</th><th>Descuento</th><th>Total noche</th></tr></thead>
-          <tbody>{rows}</tbody></table><p class="right"><b>Subtotal habitación: {p_text(fmt_usd(r.room_total))}</b></p>"""
+    if r.rooms:
+        blocks = []
+        for room in r.rooms:
+            rows = "".join(
+                f'<tr><td>{p_text(x.date)}</td><td>{p_text(fmt_usd(x.original))}</td>'
+                f'<td>-{p_text(fmt_usd(x.discount))}</td><td>{p_text(fmt_usd(x.net))}</td></tr>'
+                for x in room.night_rates
+            )
+            blocks.append(
+                f'<h3>Room {room.number}: {p_text(room.name)} '
+                f'({room.adults}-{room.children}-{room.infants})</h3>'
+                '<table><thead><tr><th>Fecha</th><th>Tarifa</th><th>Descuento</th>'
+                f'<th>Total noche</th></tr></thead><tbody>{rows}</tbody></table>'
+                f'<p class="right"><b>Subtotal habitación {room.number}: '
+                f'{p_text(fmt_usd(room.total))}</b></p>'
+            )
+        if len(r.rooms) > 1:
+            blocks.append(f'<p class="right"><b>Subtotal habitaciones: '
+                          f'{p_text(fmt_usd(r.room_total))}</b></p>')
+        room_rates_html = "".join(blocks)
 
     services_html = ""
     if r.additional_services:
@@ -557,16 +705,25 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
     if card_type == "American Express" and tc is not None:
         mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         tc_html = f'<p class="red strong">MXN ${mxn:,.2f} &nbsp;&nbsp; tc {p_text(format(tc,"f"))}</p>'
+        if r.deposit_required is not None:
+            dep_mxn = (r.deposit_required * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            tc_html += f'<p class="deposit">Depósito MXN ${dep_mxn:,.2f} (tc {p_text(tc)})</p>'
 
     amount_html = f'''<p><b>Total price:</b> {p_text(fmt_usd(r.total))}</p>
      <p><b>Taxes per stay:</b> {p_text(fmt_usd(r.taxes))}</p>
-     <p class="red strong">Pending payment: {p_text(fmt_usd(r.pending))}</p>{tc_html}'''
+     {f'<p><b>Total pendiente según Paraty (NO es el depósito):</b> {p_text(fmt_usd(r.pending))}</p>' if r.deposit_required is not None else f'<p class="red strong">Pending payment: {p_text(fmt_usd(r.pending))}</p>'}
+     {f'<p class="red strong"><b>DEPÓSITO FLEXIBLE (1 noche por habitación): {p_text(fmt_usd(r.deposit_required))}</b></p>' if r.deposit_required is not None else ''}
+     {tc_html}'''
     nights_html = f'''<p>Number of Nights: {r.nights}</p>
      <p>Check-In Date: {p_text(fmt_date(r.checkin))}</p>
      <p>Check-Out Date: {p_text(fmt_date(r.checkout))}</p>'''
-    room_meta_html = f'<h3>Rooms</h3><p>Room 1: {r.adults} Adults, {r.children} Children</p>'
+    room_meta_html = '<h3>Rooms</h3>' + ''.join(
+        f'<p>Room {room.number}: {p_text(room.name)} '
+        f'({room.adults} Adults, {room.children} Children)</p>' for room in r.rooms
+    )
     room_meta_html += (pair("Room Selected",r.room) + pair("Selected Board Plan",r.meal_plan)
                        + pair("Rate",r.rate) + pair("Promotion",r.promotion)
+                       + pair("Cancellation policy",r.cancellation_policy)
                        + pair("Additional information of interest",r.requirements))
     in_top = (amount_html + nights_html + room_meta_html) if payment_image else ""
     after_top = "" if payment_image else amount_html
@@ -590,6 +747,7 @@ h2 {{ font-size:14pt; font-weight:normal; margin:5px 0; }}
 h3 {{ font-size:10pt; margin:12px 0 5px; break-after:avoid; }}
 p {{ margin:4px 0; }}
 .red {{ color:#c91c24; }}
+.deposit {{ color:#1e4b82; font-weight:bold; font-size:10pt; }}
 .strong {{ font-weight:700; font-size:11pt; }}
 .rule {{ border:0; border-top:1px solid #444; margin:10px 0; }}
 .right {{ text-align:right; }}
@@ -798,14 +956,24 @@ def main():
     col1, col2, col3 = st.columns(3)
     col1.metric("Importe", fmt_usd(booking.total))
     col2.metric("Noches", booking.nights)
-    col3.metric("Habitación", booking.room)
+    col3.metric("Habitaciones", len(booking.rooms))
     st.write("**Huésped:**", booking.name)
     st.write("**Estancia:**", fmt_date(booking.checkin), "—", fmt_date(booking.checkout))
-    if booking.night_rates:
-        st.dataframe([{"Fecha": n.date, "Tarifa USD": float(n.original),
-                      "Descuento USD": float(n.discount), "Neto USD": float(n.net)}
-                     for n in booking.night_rates], hide_index=True, use_container_width=True)
-        st.caption(f"Subtotal habitación según desglose: {fmt_usd(booking.room_total)}")
+    if booking.rooms:
+        for room in booking.rooms:
+            st.markdown(f"**Habitación {room.number}: {room.name}** — "
+                        f"{room.adults} adultos, {room.children} menores")
+            st.dataframe([{"Fecha": n.date, "Tarifa USD": float(n.original),
+                          "Descuento USD": float(n.discount), "Neto USD": float(n.net)}
+                         for n in room.night_rates], hide_index=True, use_container_width=True)
+            st.caption(f"Subtotal habitación {room.number}: {fmt_usd(room.total)}")
+        st.write("**Subtotal todas las habitaciones:**", fmt_usd(booking.room_total))
+    if booking.deposit_required is not None:
+        st.success(f"DEPÓSITO FLEXIBLE — 1 noche por cada habitación "
+                   f"({len(booking.rooms)}): {fmt_usd(booking.deposit_required)} "
+                   "con impuestos incluidos según las tarifas de Paraty.")
+        st.caption("Se sumó la primera noche de cada habitación; "
+                   "el depósito no es el total pendiente de Paraty.")
     if booking.additional_services:
         st.subheader("Additional Services / Servicios adicionales")
         st.dataframe([{"Servicio": x.name, "Cantidad": x.quantity, "Fecha": x.date,
@@ -887,7 +1055,9 @@ def main():
     ) if payment_image else True
     st.caption("Los datos de tarjeta completos se consultan exclusivamente en Paraty Manager; Gmail no los incluye.")
 
-    disabled = (card_type == "American Express" and tc is None) or bad_four or (bool(payment_image) and not acknowledge)
+    disabled = ((card_type == "American Express" and tc is None) or bad_four or
+                (bool(payment_image) and not acknowledge) or
+                (booking.flexible_rate and booking.deposit_required is None))
     if not disabled:
         try:
             output = generate_docx(booking, card_type, tc, last_four,
