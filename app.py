@@ -16,6 +16,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from email import policy
 from email.parser import BytesParser
 from io import BytesIO
+from html import escape as html_escape
 from PIL import Image, ImageOps
 import re
 
@@ -25,7 +26,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Cm, Inches, Pt, RGBColor
 
 
 @dataclass
@@ -34,6 +35,15 @@ class Night:
     original: Decimal
     discount: Decimal
     net: Decimal
+
+
+@dataclass
+class AdditionalService:
+    name: str
+    quantity: int
+    date: str
+    price: Decimal
+    currency: str = "USD"
 
 
 @dataclass
@@ -64,6 +74,12 @@ class Booking:
     benefits: list[str] = field(default_factory=list)
     terms: str = ""
     night_rates: list[Night] = field(default_factory=list)
+    additional_services: list[AdditionalService] = field(default_factory=list)
+    room_total: Decimal = Decimal("0")
+    services_total: Decimal = Decimal("0")
+    extra_difference: Decimal = Decimal("0")
+    extra_tax_inferred: bool = False
+    tax_rate: Decimal | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -124,6 +140,9 @@ def parse_paraty_eml(data: bytes) -> Booking:
     tax_b = soup.find(["b", "strong"], string=lambda t: t and "Taxes per stay" in t)
     if tax_b:
         r.taxes = money(tax_b.parent.get_text(" ", strip=True).split(":", 1)[-1])
+        rate_hit = re.search(r"(\d+(?:\.\d+)?)\s*%", tax_b.get_text(" ", strip=True))
+        if rate_hit:
+            r.tax_rate = Decimal(rate_hit.group(1)) / Decimal("100")
     for attr, item in [("checkin", "checkinDate"), ("checkout", "checkoutDate")]:
         el = soup.find(attrs={"itemprop": item})
         if el and el.get("content"):
@@ -150,6 +169,41 @@ def parse_paraty_eml(data: bytes) -> Booking:
                     r.night_rates.append(Night(
                         date_str, money(amounts[0]), abs(money(amounts[1])), money(amounts[2])
                     ))
+    # Paraty añade estos servicios fuera de la tabla de tarifas por noche.
+    # "Price" es el importe mostrado para la línea, no se vuelve a multiplicar
+    # por Quantity porque el correo no afirma que sea tarifa unitaria.
+    for element in soup.select(".additional_service_element"):
+        name_el = element.select_one("div > b")
+        name = name_el.get_text(" ", strip=True) if name_el else ""
+        content = re.sub(r"\s+", " ", element.get_text(" ", strip=True))
+        qty_hit = re.search(r"Quantity\s*:\s*(\d+)", content, re.I)
+        date_hit = re.search(r"Date of service\s*:\s*(.+?)(?=\s+Price\s*:|$)", content, re.I)
+        price_el = element.select_one(".value_elem.currencyValue")
+        curr_el = element.select_one(".monedaConv")
+        price_hit = re.search(r"Price\s*:\s*([\d,.]+)", content, re.I)
+        price = money(price_el.get_text(" ", strip=True) if price_el else (price_hit.group(1) if price_hit else ""))
+        currency = curr_el.get_text(" ", strip=True) if curr_el else r.currency
+        if not name:
+            name = content.split("Quantity:", 1)[0].strip() or "Servicio adicional"
+        if price_el is None and price_hit is None:
+            r.warnings.append(f"No se identificó el importe del servicio adicional: {name}")
+        if currency.upper() != r.currency.upper():
+            r.warnings.append(f"Revisar moneda del servicio '{name}': {currency}")
+        r.additional_services.append(AdditionalService(
+            name=name,
+            quantity=int(qty_hit.group(1)) if qty_hit else 1,
+            date=re.sub(r"\s+,", ",", date_hit.group(1).strip()) if date_hit else "",
+            price=price,
+            currency=currency,
+        ))
+
+    r.room_total = sum((x.net for x in r.night_rates), Decimal("0"))
+    r.services_total = sum((x.price for x in r.additional_services), Decimal("0"))
+    r.extra_difference = r.total - r.room_total - r.services_total if r.night_rates else Decimal("0")
+    if r.additional_services and r.tax_rate is not None:
+        expected_tax = (r.services_total * r.tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        r.extra_tax_inferred = abs(r.extra_difference - expected_tax) <= Decimal("0.02")
+
     # Beneficios: lista bajo el bloque de Comments (no añadir políticas como beneficios).
     for ul in soup.find_all("ul"):
         texts = [li.get_text(" ", strip=True) for li in ul.find_all("li")]
@@ -172,8 +226,10 @@ def parse_paraty_eml(data: bytes) -> Booking:
     if not r.room: r.warnings.append("No se identificó la habitación")
     if r.total <= 0: r.warnings.append("Revisar el importe total extraído del correo")
     if not r.checkin or not r.checkout: r.warnings.append("Faltan fechas")
-    if r.night_rates and sum((x.net for x in r.night_rates), Decimal("0")) != r.total:
+    if r.night_rates and not r.additional_services and abs(r.room_total - r.total) > Decimal("0.02"):
         r.warnings.append("La suma de tarifas por noche no coincide con el importe total")
+    elif r.night_rates and r.additional_services and abs(r.extra_difference) > Decimal("0.02") and not r.extra_tax_inferred:
+        r.warnings.append("El total de habitación más servicios no concilia exactamente con el total Paraty; revisar diferencia antes de generar el Word")
     if r.nights and r.night_rates and len(r.night_rates) != r.nights:
         r.warnings.append("El número de desglose de noches no coincide con la estancia")
     return r
@@ -249,13 +305,24 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
 
     header = d.add_table(rows=1, cols=2)
     header.autofit = False
-    header.columns[0].width = Inches(5.1)
-    header.columns[1].width = Inches(2.1)
+    # Ancho útil Carta con márgenes de 0.55 in: 18.8 cm aprox.
+    # La columna derecha mide 7.5 cm para alojar una foto de hasta 7 x 10 cm.
+    header.columns[0].width = Cm(11.25)
+    header.columns[1].width = Cm(7.5)
     left, right = header.rows[0].cells
     left.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
     right.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
-    for idx, cell in enumerate((left, right)):
-        cell.width = Inches(5.1 if idx == 0 else 2.1)
+    left.width, right.width = Cm(11.25), Cm(7.5)
+    # Quitar por completo el antiguo recuadro gris; conservar solo la imagen
+    # sin fondo ni borde. Reducimos el relleno para que quepan 7 cm de ancho.
+    tc_mar = right._tc.get_or_add_tcPr()
+    margins = OxmlElement("w:tcMar")
+    for edge in ("top", "left", "bottom", "right"):
+        item = OxmlElement(f"w:{edge}")
+        item.set(qn("w:w"), "30")
+        item.set(qn("w:type"), "dxa")
+        margins.append(item)
+    tc_mar.append(margins)
     p = left.paragraphs[0]
     para(p, "Name: " + r.name, size=14)
     for label, value in [
@@ -267,42 +334,75 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
             q = left.add_paragraph()
             para(q, label + ": ", True, size=8)
             para(q, value, size=8)
-    set_cell_shading(right, "F1F4F8")
-    right.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-    para(right.paragraphs[0], "REFERENCIA DE PAGO", True, size=8)
     if payment_image:
-        p_img = right.add_paragraph()
-        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        # Conservar el encabezado en la esquina superior derecha.
+        # Cuando la imagen vertical ocupa ~10 cm, aprovechamos el espacio
+        # libre de la columna izquierda para no desperdiciar media página.
+        q = left.add_paragraph()
+        para(q, "Total price: ", True)
+        para(q, fmt_usd(r.total))
+        q = left.add_paragraph()
+        para(q, "Taxes per stay: ", True)
+        para(q, fmt_usd(r.taxes))
+        q = left.add_paragraph()
+        para(q, "Pending payment: ", True, color=(200, 30, 30), size=11)
+        para(q, fmt_usd(r.pending), True, color=(200, 30, 30), size=11)
+        if card_type == "American Express" and tc is not None:
+            mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            q = left.add_paragraph()
+            para(q, "MXN $" + f"{mxn:,.2f}" + "     tc " + format(tc, "f"), True,
+                 color=(200, 30, 30), size=11)
+        q = left.add_paragraph()
+        para(q, f"Number of Nights: {r.nights}\nCheck-In Date: {fmt_date(r.checkin)}\nCheck-Out Date: {fmt_date(r.checkout)}")
+        q = left.add_paragraph()
+        para(q, "Rooms", True, size=10)
+        q = left.add_paragraph()
+        para(q, f"Room 1: {r.adults} Adults, {r.children} Children", size=8)
+        for label, val in [
+            ("Room Selected", r.room), ("Selected Board Plan", r.meal_plan),
+            ("Rate", r.rate), ("Promotion", r.promotion),
+            ("Additional information of interest", r.requirements),
+        ]:
+            if val:
+                q = left.add_paragraph()
+                para(q, label + ": ", True, size=8)
+                para(q, val, size=8)
+
+    if payment_image:
+        # Cuadro máximo 7 x 10 cm. Mantener proporciones; no estirar el recorte.
+        p_img = right.paragraphs[0]
+        p_img.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        p_img.paragraph_format.space_after = Pt(0)
         with Image.open(BytesIO(payment_image)) as img:
-            scale = min(1.85 / img.width, 1.30 / img.height)
-            display_width = max(img.width * scale, 0.1)
-            display_height = max(img.height * scale, 0.1)
+            ratio = min(7.0 / img.width, 10.0 / img.height)
+            width_cm = img.width * ratio
+            height_cm = img.height * ratio
         p_img.add_run().add_picture(BytesIO(payment_image),
-                                    width=Inches(display_width), height=Inches(display_height))
-        p_img.paragraph_format.space_after = Pt(2)
-        para(right.add_paragraph(), "Imagen enmascarada", size=7.5)
-    else:
-        para(right.add_paragraph(), "Consultar tarjeta en Paraty Manager", size=8)
+                                    width=Cm(width_cm), height=Cm(height_cm))
     if card_type != "No identificado":
-        para(right.add_paragraph(), "Tipo: " + card_type, size=8)
+        q = right.add_paragraph()
+        q.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        para(q, "Tipo: " + card_type, size=8)
     if last_four:
-        para(right.add_paragraph(), "Terminación: " + last_four, size=8)
+        q = right.add_paragraph()
+        q.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        para(q, "Terminación: " + last_four, size=8)
 
     d.add_paragraph("_________________________________________________________________________________")
-    p = d.add_paragraph()
-    para(p, "Total price: ", True)
-    para(p, fmt_usd(r.total))
-    p = d.add_paragraph()
-    para(p, "Taxes per stay: ", True)
-    para(p, fmt_usd(r.taxes))
-    p = d.add_paragraph()
-    para(p, "Pending payment: ", True, color=(200, 30, 30), size=11)
-    para(p, fmt_usd(r.pending), True, color=(200, 30, 30), size=11)
-    if card_type == "American Express" and tc is not None:
-        mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if not payment_image:
         p = d.add_paragraph()
-        para(p, "MXN $" + f"{mxn:,.2f}" + "     tc " + format(tc, "f"), True, color=(200, 30, 30), size=11)
+        para(p, "Total price: ", True)
+        para(p, fmt_usd(r.total))
+        p = d.add_paragraph()
+        para(p, "Taxes per stay: ", True)
+        para(p, fmt_usd(r.taxes))
+        p = d.add_paragraph()
+        para(p, "Pending payment: ", True, color=(200, 30, 30), size=11)
+        para(p, fmt_usd(r.pending), True, color=(200, 30, 30), size=11)
+        if card_type == "American Express" and tc is not None:
+            mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            p = d.add_paragraph()
+            para(p, "MXN $" + f"{mxn:,.2f}" + "     tc " + format(tc, "f"), True,
+                 color=(200, 30, 30), size=11)
 
     d.add_paragraph()
     if r.night_rates:
@@ -321,22 +421,51 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
                 para(cell.paragraphs[0], content, size=8)
         p = d.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        para(p, "Total: " + fmt_usd(r.total), True)
+        para(p, "Subtotal habitación: " + fmt_usd(r.room_total), True)
 
-    p = d.add_paragraph()
-    para(p, f"Number of Nights: {r.nights}\nCheck-In Date: {fmt_date(r.checkin)}\nCheck-Out Date: {fmt_date(r.checkout)}")
-    p = d.add_paragraph()
-    para(p, "Rooms", True, size=10)
-    d.add_paragraph(f"Room 1: {r.adults} Adults, {r.children} Children")
-    for label, val in [
-        ("Room Selected", r.room), ("Selected Board Plan", r.meal_plan),
-        ("Rate", r.rate), ("Promotion", r.promotion),
-        ("Additional information of interest", r.requirements),
-    ]:
-        if val:
-            p=d.add_paragraph()
-            para(p, label + ": ", True)
-            para(p, val)
+    if r.additional_services:
+        p = d.add_paragraph()
+        para(p, "ADDITIONAL SERVICES / SERVICIOS ADICIONALES", True, size=10)
+        tab_services = d.add_table(rows=1, cols=4)
+        tab_services.style = "Table Grid"
+        tab_services.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for cell, title in zip(tab_services.rows[0].cells, ["Servicio", "Cantidad", "Fecha", "Precio"]):
+            set_cell_shading(cell, "2261A8")
+            para(cell.paragraphs[0], title, True, color=(255, 255, 255), size=8)
+        for item in r.additional_services:
+            cells = tab_services.add_row().cells
+            for cell, content in zip(cells, [item.name, str(item.quantity), item.date, f"{item.price:,.2f} {item.currency}"]):
+                para(cell.paragraphs[0], content, size=8)
+        p = d.add_paragraph()
+        para(p, "Subtotal servicios: ", True)
+        para(p, fmt_usd(r.services_total))
+        if abs(r.extra_difference) > Decimal("0.02"):
+            p = d.add_paragraph()
+            description = "Impuestos adicionales sobre servicios (inferidos por conciliación): " if r.extra_tax_inferred else "Diferencia por conciliar con el total Paraty: "
+            para(p, description, True, color=(160, 75, 0), size=8)
+            para(p, fmt_usd(r.extra_difference), color=(160, 75, 0), size=8)
+            if r.extra_tax_inferred:
+                para(d.add_paragraph(), "El correo no desglosa por separado el impuesto del servicio; importe calculado usando la tasa indicada en Paraty.", size=7)
+        p = d.add_paragraph()
+        para(p, "Total oficial Paraty: ", True)
+        para(p, fmt_usd(r.total), True)
+
+    if not payment_image:
+        p = d.add_paragraph()
+        para(p, f"Number of Nights: {r.nights}\nCheck-In Date: {fmt_date(r.checkin)}\nCheck-Out Date: {fmt_date(r.checkout)}")
+    if not payment_image:
+        p = d.add_paragraph()
+        para(p, "Rooms", True, size=10)
+        d.add_paragraph(f"Room 1: {r.adults} Adults, {r.children} Children")
+        for label, val in [
+            ("Room Selected", r.room), ("Selected Board Plan", r.meal_plan),
+            ("Rate", r.rate), ("Promotion", r.promotion),
+            ("Additional information of interest", r.requirements),
+        ]:
+            if val:
+                p=d.add_paragraph()
+                para(p, label + ": ", True)
+                para(p, val)
     if r.comments:
         p=d.add_paragraph()
         para(p, "Comments: ", True)
@@ -360,6 +489,148 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
     data=BytesIO()
     d.save(data)
     return data.getvalue()
+
+
+def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
+                        last_four: str = "", inssist_number: str = "",
+                        payment_image: bytes | None = None) -> str:
+    """Vista imprimible desde el navegador, sin descargar Word ni enviar datos.
+
+    Al pulsar el botón del visor se abre el diálogo de impresión del navegador.
+    Se imprime solamente este HTML de la reservación, no la interfaz Streamlit.
+    """
+    h = html_escape
+    def p_text(s: object) -> str:
+        return h(str(s), quote=True)
+    def pair(label: str, value: str) -> str:
+        return (f'<p><b>{h(label)}:</b> {p_text(value)}</p>') if value else ""
+    img_html = ""
+    if payment_image:
+        encoded = base64.b64encode(payment_image).decode("ascii")
+        img_html = (f'<img alt="Imagen de referencia enmascarada" '
+                    f'src="data:image/png;base64,{encoded}" '
+                    f'style="display:block;max-width:7cm;max-height:10cm;width:auto;height:auto;margin-left:auto" />')
+    payment_label = ""
+    if card_type != "No identificado":
+        payment_label += pair("Tipo", card_type)
+    if last_four:
+        payment_label += pair("Terminación", last_four)
+    image_column = f'<div class="payment-image">{img_html}{payment_label}</div>'
+
+    room_rates_html = ""
+    if r.night_rates:
+        rows = "".join(
+            f'<tr><td>{p_text(x.date)}</td><td>{p_text(fmt_usd(x.original))}</td>'
+            f'<td>-{p_text(fmt_usd(x.discount))}</td><td>{p_text(fmt_usd(x.net))}</td></tr>'
+            for x in r.night_rates
+        )
+        room_rates_html = f"""<h3>Room 1: {p_text(r.room)} ({r.adults}-{r.children}-0)</h3>
+          <table><thead><tr><th>Fecha</th><th>Tarifa</th><th>Descuento</th><th>Total noche</th></tr></thead>
+          <tbody>{rows}</tbody></table><p class="right"><b>Subtotal habitación: {p_text(fmt_usd(r.room_total))}</b></p>"""
+
+    services_html = ""
+    if r.additional_services:
+        rows = "".join(
+            f'<tr><td>{p_text(x.name)}</td><td>{x.quantity}</td><td>{p_text(x.date)}</td>'
+            f'<td>{p_text(f"{x.price:,.2f} {x.currency}")}</td></tr>'
+            for x in r.additional_services
+        )
+        diff_html = ""
+        if abs(r.extra_difference) > Decimal("0.02"):
+            label = ("Impuestos adicionales sobre servicios (inferidos por conciliación)" if
+                     r.extra_tax_inferred else "Diferencia por conciliar con el total Paraty")
+            diff_html = f'<p class="note"><b>{h(label)}:</b> {p_text(fmt_usd(r.extra_difference))}</p>'
+            if r.extra_tax_inferred:
+                diff_html += '<p class="small">Paraty no desglosa este impuesto por servicio; se infiere de la tasa indicada.</p>'
+        services_html = f"""<h3>ADDITIONAL SERVICES / SERVICIOS ADICIONALES</h3>
+        <table><thead><tr><th>Servicio</th><th>Cantidad</th><th>Fecha</th><th>Precio</th></tr></thead>
+        <tbody>{rows}</tbody></table>
+        <p><b>Subtotal servicios:</b> {p_text(fmt_usd(r.services_total))}</p>
+        {diff_html}
+        <p><b>Total oficial Paraty: {p_text(fmt_usd(r.total))}</b></p>"""
+
+    benefits_html = ""
+    if r.benefits:
+        benefits_html = "<h3>BENEFITS</h3><ul>" + "".join(
+            f"<li>{p_text(item)}</li>" for item in r.benefits) + "</ul>"
+    tc_html = ""
+    if card_type == "American Express" and tc is not None:
+        mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        tc_html = f'<p class="red strong">MXN ${mxn:,.2f} &nbsp;&nbsp; tc {p_text(format(tc,"f"))}</p>'
+
+    amount_html = f'''<p><b>Total price:</b> {p_text(fmt_usd(r.total))}</p>
+     <p><b>Taxes per stay:</b> {p_text(fmt_usd(r.taxes))}</p>
+     <p class="red strong">Pending payment: {p_text(fmt_usd(r.pending))}</p>{tc_html}'''
+    nights_html = f'''<p>Number of Nights: {r.nights}</p>
+     <p>Check-In Date: {p_text(fmt_date(r.checkin))}</p>
+     <p>Check-Out Date: {p_text(fmt_date(r.checkout))}</p>'''
+    room_meta_html = f'<h3>Rooms</h3><p>Room 1: {r.adults} Adults, {r.children} Children</p>'
+    room_meta_html += (pair("Room Selected",r.room) + pair("Selected Board Plan",r.meal_plan)
+                       + pair("Rate",r.rate) + pair("Promotion",r.promotion)
+                       + pair("Additional information of interest",r.requirements))
+    in_top = (amount_html + nights_html + room_meta_html) if payment_image else ""
+    after_top = "" if payment_image else amount_html
+    after_rates = "" if payment_image else (nights_html + room_meta_html)
+
+    return f"""<!doctype html>
+<html lang="es"><head><meta charset="utf-8" />
+<style>
+@page {{ size: letter; margin: .53in .55in .55in .55in; }}
+* {{ box-sizing: border-box; }}
+html, body {{ margin:0; padding:0; font-family: Arial, sans-serif; color:#111; }}
+body {{ font-size: 9pt; }}
+.toolbar {{ padding:9px 12px; background:#fff; text-align:left; }}
+button {{ cursor:pointer; background:#1452a3; color:white; border:0; border-radius:6px; padding:9px 16px; font-size:14px; font-weight:600; }}
+button:hover {{ background:#0d3f83; }}
+.instructions {{ font-size:12px; margin-left:10px; color:#596273; }}
+.paper {{ max-width: 21.6cm; margin:0 auto; padding: .53in .55in .55in .55in; }}
+.top {{ display:grid; grid-template-columns:minmax(0,1fr) 7.5cm; column-gap:.15cm; align-items:start; }}
+.payment-image {{ text-align:right; padding:0; margin:0; background:transparent; border:0; }}
+h2 {{ font-size:14pt; font-weight:normal; margin:5px 0; }}
+h3 {{ font-size:10pt; margin:12px 0 5px; break-after:avoid; }}
+p {{ margin:4px 0; }}
+.red {{ color:#c91c24; }}
+.strong {{ font-weight:700; font-size:11pt; }}
+.rule {{ border:0; border-top:1px solid #444; margin:10px 0; }}
+.right {{ text-align:right; }}
+.note {{ color:#a04b00; font-size:8pt; }}
+.small {{ font-size:7.5pt; }}
+table {{ width:100%; border-collapse:collapse; table-layout:fixed; margin:3px 0; font-size:8pt; }}
+th,td {{ border:1px solid #4c4c4c; padding:3px 4px; overflow-wrap:anywhere; }}
+th {{ background:#2261a8; color:#fff; text-align:left; }}
+tr {{ break-inside:avoid; }}
+ul {{ margin:3px 0 10px; padding-left:20px; font-size:8pt; }}
+.terms {{ font-size:8pt; }}
+@media print {{
+  .toolbar {{ display:none !important; }}
+  .paper {{ max-width:none; margin:0; padding:0; }}
+  body {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
+}}
+@media screen {{
+  .paper {{ display:none; }}
+}}
+</style></head><body>
+<div class="toolbar"><button type="button" onclick="window.print()">🖨️ Imprimir confirmación</button>
+<span class="instructions">Abre el diálogo de impresión de tu navegador.</span></div>
+<article class="paper">
+ <p><b>Booking reference:</b> {p_text(r.reference)}</p>
+ {pair("Confirmación INSSIST", inssist_number)}
+ <p>Origin: {p_text(r.origin)}</p><p>Device: {p_text(r.device)}</p>
+ <div class="top"><div><h2>Name: {p_text(r.name)}</h2>
+ {pair("Email address",r.email)}{pair("Telephone",r.phone)}
+ {pair("Address",r.location)}{pair("Special requirements",r.requirements)}
+ {pair("Estimated Time of Arrival",r.arrival_time)}
+ {in_top}
+ </div>{image_column}</div>
+ <hr class="rule" />
+ {after_top}
+ {room_rates_html}
+ {services_html}
+ {after_rates}
+ {pair("Comments",r.comments)}
+ {benefits_html}
+ <h3>BOOKING TERMS AND CONDITIONS</h3><p class="terms">{p_text(r.terms)}</p>
+ </article></body></html>"""
 
 
 # OAuth de escritorio: apropiado únicamente cuando la app Streamlit corre en la
@@ -534,6 +805,19 @@ def main():
         st.dataframe([{"Fecha": n.date, "Tarifa USD": float(n.original),
                       "Descuento USD": float(n.discount), "Neto USD": float(n.net)}
                      for n in booking.night_rates], hide_index=True, use_container_width=True)
+        st.caption(f"Subtotal habitación según desglose: {fmt_usd(booking.room_total)}")
+    if booking.additional_services:
+        st.subheader("Additional Services / Servicios adicionales")
+        st.dataframe([{"Servicio": x.name, "Cantidad": x.quantity, "Fecha": x.date,
+                       "Importe": f"{x.price:,.2f} {x.currency}"}
+                      for x in booking.additional_services], hide_index=True, use_container_width=True)
+        st.write("**Subtotal servicios:**", fmt_usd(booking.services_total))
+        if abs(booking.extra_difference) > Decimal("0.02"):
+            if booking.extra_tax_inferred:
+                st.info(f"Diferencia calculada como impuesto sobre servicios: {fmt_usd(booking.extra_difference)}. Revisar contra Paraty; no aparece desglosada por servicio.")
+            else:
+                st.warning(f"Diferencia pendiente de conciliar: {fmt_usd(booking.extra_difference)}")
+        st.write("**Total oficial de la reservación:**", fmt_usd(booking.total))
     st.divider()
 
     inssist_number = st.text_input(
@@ -560,7 +844,7 @@ def main():
     if bad_four:
         st.error("Escribe exactamente cuatro dígitos o deja el campo vacío.")
 
-    st.subheader("Imagen de referencia (esquina superior derecha)")
+    st.subheader("Imagen de referencia (esquina superior derecha, 7 × 10 cm)")
     st.warning("Por seguridad, NO pegues capturas que muestren número completo de tarjeta, CVV, fecha de vencimiento u otros datos bancarios sensibles. Ocúltalos antes de copiar la imagen. El Word no es una bóveda PCI.")
     st.caption("Copia una imagen previamente enmascarada (Windows + Shift + S) y pulsa Pegar imagen. También puedes subir un PNG/JPG enmascarado.")
     p = paste_image_button("Pegar imagen copiada del portapapeles",
@@ -573,7 +857,10 @@ def main():
             st.session_state["payment_image"] = prepare_masked_image(buf.getvalue())
         except ValueError as exc:
             st.error(str(exc))
-    uploaded_image = st.file_uploader("O subir imagen ya enmascarada", type=["png", "jpg", "jpeg"], key=f"image_upload_{source_key}_{st.session_state.get('image_upload_version', 0)}")
+    # No mostrar permanentemente el cuadro grande de drag-and-drop: la captura
+    # del portapapeles es la vía principal. La carga queda disponible como respaldo.
+    with st.expander("Alternativa: subir imagen PNG/JPG", expanded=False):
+        uploaded_image = st.file_uploader("Seleccionar imagen ya enmascarada", type=["png", "jpg", "jpeg"], key=f"image_upload_{source_key}_{st.session_state.get('image_upload_version', 0)}")
     if uploaded_image is not None:
         try:
             import hashlib
@@ -586,7 +873,7 @@ def main():
             st.error(str(exc))
     payment_image = st.session_state.get("payment_image")
     if payment_image:
-        st.image(payment_image, caption="Vista previa: imagen que quedará en la parte superior derecha", width=280)
+        st.image(payment_image, caption="Imagen para Word: espacio máximo 7 cm ancho × 10 cm alto, sin recuadro gris", width=360)
         if st.button("Quitar imagen"):
             st.session_state.pop("payment_image", None)
             st.session_state.pop("last_image_upload_hash", None)
@@ -605,10 +892,22 @@ def main():
         try:
             output = generate_docx(booking, card_type, tc, last_four,
                                    inssist_number=inssist_number, payment_image=payment_image)
-            st.download_button("Descargar confirmación Word", output,
-                               file_name=f"Confirmacion_{booking.reference}.docx",
-                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                               type="primary")
+            col_word, col_print = st.columns([1, 1], gap="medium")
+            with col_word:
+                st.download_button("Descargar confirmación Word", output,
+                                   file_name=f"Confirmacion_{booking.reference}.docx",
+                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                   type="primary", use_container_width=True)
+            with col_print:
+                st.caption("Impresión directa: haz clic en el botón azul que aparece debajo.")
+            # Streamlit se ejecuta en un navegador: no puede mandar un .docx a la
+            # impresora de una computadora remota. Imprimimos el mismo contenido
+            # desde una vista HTML local que abre el diálogo del navegador.
+            import streamlit.components.v1 as components
+            print_html = generate_print_html(booking, card_type, tc, last_four,
+                                             inssist_number=inssist_number,
+                                             payment_image=payment_image)
+            components.html(print_html, height=66, scrolling=False)
         except Exception as exc:
             st.error(f"No se pudo generar el Word: {exc}")
     else:
