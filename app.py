@@ -19,6 +19,7 @@ from io import BytesIO
 from html import escape as html_escape
 from PIL import Image, ImageOps
 import re
+import unicodedata
 
 from bs4 import BeautifulSoup
 from docx import Document
@@ -104,6 +105,8 @@ class Booking:
     deposit_services_charge: Decimal = Decimal("0")
     deposit_base_amount: Decimal | None = None
     flexible_rate: bool = False
+    policy_status: str = "revisar"
+    policy_reason: str = ""
     deposit_tax_included_verified: bool = False
     additional_services: list[AdditionalService] = field(default_factory=list)
     room_total: Decimal = Decimal("0")
@@ -142,6 +145,70 @@ def after_label_text(soup: BeautifulSoup, label: str, stop_labels: list[str]) ->
     if content:
         return content
     return ""
+
+
+
+def classify_from_cancellation_terms(booking: Booking) -> tuple[str, str]:
+    """Clasifica por políticas de cancelación y pago; NO por el nombre Rate.
+
+    Nunca asumir depósito de una noche sin evidencia explícita de pago.
+    Si la política es ambigua o contradictoria, requerir revisión.
+    """
+    policy_text = " ".join([booking.cancellation_policy, booking.terms]).strip()
+    normalized = unicodedata.normalize("NFKD", policy_text).encode("ascii", "ignore").decode().lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if not normalized:
+        return "revisar", "No aparecen condiciones de cancelación o pago verificables."
+
+    free_cancellation = bool(re.search(
+        r"free cancell?ation|free of charge.{0,90}cancel|cancel.{0,100}(?:for free|free of charge)|"
+        r"cancel.{0,90}(?:without (?:charge|penalty)|sin cargo|sin costo|sin penalizacion|gratuita?)|"
+        r"cancelacion gratuita", normalized
+    ))
+    no_cancellation = bool(re.search(
+        r"cancel(?:lations?|ations?|ing)?(?: and modifications)? (?:are |is )?"
+        r"(?:not permitted|not allowed|prohibited)|"
+        r"cannot be cancel(?:led|ed)|no se (?:permite|permiten) (?:la |las )?cancelaciones?|"
+        r"cancelaciones? no (?:permitidas?|admitidas?)", normalized
+    ))
+    nonrefundable = bool(re.search(
+        r"non[ -]?refundable|no reembolsable|"
+        r"(?:if you cancel|si cancelas|si cancela).{0,130}no refund", normalized
+    ))
+    one_night_deposit = bool(re.search(
+        r"(?:deposit|deposito|anticipo).{0,90}?(?:1|one|una?)\s*(?:night|noche)|"
+        r"(?:1|one|una?)\s*(?:night|noche).{0,90}?(?:deposit|deposito|anticipo)",
+        normalized
+    ))
+    full_payment = bool(re.search(
+        r"(?:payment|pay|pago|cobro).{0,60}?100\s*%|"
+        r"100\s*%.{0,90}?(?:time of booking|time of reservation|al reservar|reserva)|"
+        r"(?:full|total) (?:payment|amount) (?:due|required) (?:at|upon) booking", normalized
+    ))
+
+    if free_cancellation and (no_cancellation or nonrefundable):
+        return "revisar", "Hay condiciones contradictorias de cancelación gratuita y no reembolsable."
+    if no_cancellation or nonrefundable:
+        if one_night_deposit:
+            return "revisar", "La política restringe cancelaciones, pero también menciona depósito de una noche."
+        if not full_payment:
+            return "revisar", "Cancelación no reembolsable, pero no se especifica cobro total anticipado."
+        return "no_reembolsable", "Cancelaciones no permitidas o sin reembolso y pago total anticipado."
+    if free_cancellation and one_night_deposit:
+        if full_payment:
+            return "revisar", "La política indica depósito de una noche y también pago total anticipado."
+        return "flexible", "Cancelación gratuita según plazo y depósito explícito de una noche."
+    if free_cancellation:
+        return "revisar", "Se permite cancelación gratuita, pero no se confirma depósito de una noche."
+    if one_night_deposit:
+        return "revisar", "Se menciona depósito de una noche, pero la política de cancelación no es clara."
+    return "revisar", "No se identifica una política de depósito y cancelación concluyente."
+
+
+def policy_label(booking: Booking) -> str:
+    return {"flexible": "Flexible - depósito de una noche",
+            "no_reembolsable": "No reembolsable",
+            "revisar": "REVISAR POLÍTICAS ANTES DEL COBRO"}.get(booking.policy_status, "Revisar")
 
 
 def parse_paraty_eml(data: bytes) -> Booking:
@@ -278,13 +345,36 @@ def parse_paraty_eml(data: bytes) -> Booking:
         r.additional_services and r.night_rates and abs(r.extra_difference) <= Decimal("0.02")
     )
 
-    # Tarifa FLEXIBLE: (alojamiento total / noches) + todos los suplementos
-    # con IVA del 16%, cobrados completos en la primera noche. El total oficial
-    # de Paraty puede incluir los suplementos; nunca se suman de nuevo al total
-    # general ni se prorratean. Si Paraty no concilia con 16%, avisamos y usamos
-    # el subtotal detallado de habitación como base, SIN cargar la diferencia
-    # automáticamente al anticipo.
-    r.flexible_rate = bool(re.search(r"\bFLEXIBLE\b", r.rate or "", re.I))
+    # La categoría de cobro se define solo DESPUÉS de leer las condiciones
+    # de cancelación y pago. El nombre comercial de la tarifa es informativo.
+    # La extracción de BOOKING TERMS AND CONDITIONS se hace antes del cálculo.
+    terms_b = soup.find(["b", "strong"], string=lambda t: t and "BOOKING TERMS AND CONDITIONS" in t)
+    if terms_b:
+        parts = []
+        for sib in terms_b.next_siblings:
+            if getattr(sib, "name", None) in ["div", "p"]:
+                parts.append(sib.get_text(" ", strip=True))
+            elif isinstance(sib, str):
+                parts.append(sib.strip())
+        r.terms = re.sub(r"\s+", " ", " ".join(x for x in parts if x))
+    r.policy_status, r.policy_reason = classify_from_cancellation_terms(r)
+    # Si el título comercial contradice frontalmente las políticas, no
+    # automatizamos un cobro aunque existan términos interpretables.
+    label = r.rate.lower()
+    if (r.policy_status == "flexible" and
+            re.search(r"non[ -]?refundable|\bnrf\b|no reembolsable", label)):
+        r.policy_status = "revisar"
+        r.policy_reason = ("El nombre de la tarifa indica no reembolsable, "
+                           "pero las políticas describen cancelación gratuita y depósito.")
+    elif (r.policy_status == "no_reembolsable" and "flexible" in label):
+        r.policy_status = "revisar"
+        r.policy_reason = ("El nombre de la tarifa dice flexible, pero las "
+                           "políticas indican cancelación no reembolsable.")
+    r.flexible_rate = r.policy_status == "flexible"
+    if r.policy_status == "revisar":
+        r.warnings.append("POLÍTICA POR REVISAR: " + r.policy_reason +
+                          " No se calcula ni recomienda un depósito automático.")
+
     if r.flexible_rate:
         if r.nights <= 0 or r.total <= 0:
             r.warnings.append("No se puede calcular el depósito flexible: faltan noches "
@@ -323,17 +413,6 @@ def parse_paraty_eml(data: bytes) -> Booking:
         if texts and any("discount" in t.lower() or "credit" in t.lower() or "upgrade" in t.lower() for t in texts):
             r.benefits = texts
             break
-    # Conserva únicamente términos textuales suministrados en el correo.
-    terms_b = soup.find(["b", "strong"], string=lambda t: t and "BOOKING TERMS AND CONDITIONS" in t)
-    if terms_b:
-        parts = []
-        for sib in terms_b.next_siblings:
-            if getattr(sib, "name", None) in ["div", "p"]:
-                parts.append(sib.get_text(" ", strip=True))
-            elif isinstance(sib, str):
-                parts.append(sib.strip())
-        r.terms = " ".join(x for x in parts if x)
-        r.terms = re.sub(r"\s+", " ", r.terms)
     # Marcamos valores que podrían requerir revisión antes de archivar.
     if not r.name: r.warnings.append("Falta el nombre del huésped")
     if not r.room: r.warnings.append("No se identificó la habitación")
@@ -505,6 +584,7 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
         for label, val in [
             ("Room Selected", r.room), ("Selected Board Plan", r.meal_plan),
             ("Rate", r.rate), ("Promotion", r.promotion),
+            ("Política detectada", policy_label(r)),
             ("Cancellation policy", r.cancellation_policy),
             ("Additional information of interest", r.requirements),
         ]:
@@ -649,6 +729,7 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
         for label, val in [
             ("Room Selected", r.room), ("Selected Board Plan", r.meal_plan),
             ("Rate", r.rate), ("Promotion", r.promotion),
+            ("Política detectada", policy_label(r)),
             ("Cancellation policy", r.cancellation_policy),
             ("Additional information of interest", r.requirements),
         ]:
@@ -775,6 +856,7 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
     )
     room_meta_html += (pair("Room Selected",r.room) + pair("Selected Board Plan",r.meal_plan)
                        + pair("Rate",r.rate) + pair("Promotion",r.promotion)
+                       + pair("Política detectada",policy_label(r))
                        + pair("Cancellation policy",r.cancellation_policy)
                        + pair("Additional information of interest",r.requirements))
     in_top = (amount_html + nights_html + room_meta_html) if payment_image else ""
@@ -1005,6 +1087,15 @@ def main():
         for warning in booking.warnings:
             st.warning(warning)
     st.subheader(f"Paraty: {booking.reference}")
+    st.write("**Detección basada en políticas de cancelación y pago:**")
+    if booking.policy_status == "flexible":
+        st.success(policy_label(booking) + " — " + booking.policy_reason)
+    elif booking.policy_status == "no_reembolsable":
+        st.info(policy_label(booking) + " — " + booking.policy_reason)
+    else:
+        st.error(policy_label(booking) + " — " + booking.policy_reason)
+    st.caption("Nombre de tarifa Paraty: " + (booking.rate or "No identificado") +
+               ". El nombre no determina el anticipo; prevalecen las políticas del correo.")
     col1, col2, col3 = st.columns(3)
     col1.metric("Importe", fmt_usd(booking.total))
     col2.metric("Noches", booking.nights)
