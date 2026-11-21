@@ -28,6 +28,10 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
 
+# Impuesto definido por el hotel para los servicios adicionales. No confundir
+# con la tasa de impuesto sobre el alojamiento que informa Paraty.
+ADDITIONAL_SERVICES_TAX_RATE = Decimal("0.16")
+
 
 @dataclass
 class Night:
@@ -103,9 +107,11 @@ class Booking:
     deposit_tax_included_verified: bool = False
     additional_services: list[AdditionalService] = field(default_factory=list)
     room_total: Decimal = Decimal("0")
-    services_total: Decimal = Decimal("0")
-    extra_difference: Decimal = Decimal("0")
-    extra_tax_inferred: bool = False
+    services_total: Decimal = Decimal("0")  # Base de servicios antes de impuesto
+    services_tax: Decimal = Decimal("0")
+    services_with_tax: Decimal = Decimal("0")
+    extra_difference: Decimal = Decimal("0")  # Total Paraty menos habitaciones y servicios con IVA
+    services_tax_reconciled: bool = False
     tax_rate: Decimal | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -256,20 +262,28 @@ def parse_paraty_eml(data: bytes) -> Booking:
 
     r.room_total = sum((room.total for room in r.rooms), Decimal("0"))
     r.services_total = sum((x.price for x in r.additional_services), Decimal("0"))
-    r.extra_difference = r.total - r.room_total - r.services_total if r.night_rates else Decimal("0")
-    if r.additional_services and r.tax_rate is not None:
-        expected_tax = (r.services_total * r.tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        r.extra_tax_inferred = abs(r.extra_difference - expected_tax) <= Decimal("0.02")
+    # El precio mostrado por Paraty se trata como base del servicio. El 16% se
+    # agrega SOLO a servicios; nunca se aplica a la tarifa de habitación.
+    # Redondeamos el IVA por línea para reflejar el cargo de cada servicio.
+    r.services_tax = sum(
+        ((x.price * ADDITIONAL_SERVICES_TAX_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+         for x in r.additional_services), Decimal("0")
+    )
+    r.services_with_tax = r.services_total + r.services_tax
+    r.extra_difference = (
+        r.total - r.room_total - r.services_with_tax
+        if r.night_rates else Decimal("0")
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    r.services_tax_reconciled = bool(
+        r.additional_services and r.night_rates and abs(r.extra_difference) <= Decimal("0.02")
+    )
 
-    # Regla de cobro para tarifa FLEXIBLE:
-    #   (importe TOTAL de alojamiento / número de noches) +
-    #   servicios adicionales completos incluidos en el total de Paraty.
-    # El total de Paraty YA incluye los servicios, de manera que se restan
-    # ANTES de prorratear y se vuelven a añadir una sola vez al depósito.
-    # En el caso de extras gravados, incluir sus impuestos solo cuando la
-    # diferencia concilie exactamente con el porcentaje informado por Paraty.
-    # Todas las habitaciones forman parte del total de la reservación: nunca
-    # multiplicar nuevamente el promedio por el número de habitaciones.
+    # Tarifa FLEXIBLE: (alojamiento total / noches) + todos los suplementos
+    # con IVA del 16%, cobrados completos en la primera noche. El total oficial
+    # de Paraty puede incluir los suplementos; nunca se suman de nuevo al total
+    # general ni se prorratean. Si Paraty no concilia con 16%, avisamos y usamos
+    # el subtotal detallado de habitación como base, SIN cargar la diferencia
+    # automáticamente al anticipo.
     r.flexible_rate = bool(re.search(r"\bFLEXIBLE\b", r.rate or "", re.I))
     if r.flexible_rate:
         if r.nights <= 0 or r.total <= 0:
@@ -278,20 +292,18 @@ def parse_paraty_eml(data: bytes) -> Booking:
         elif not r.rooms or len(r.rooms) > 4:
             r.warnings.append("No se puede calcular el depósito flexible sin identificar "
                               "entre 1 y 4 habitaciones. Revisar Paraty.")
-        elif r.additional_services and (abs(r.extra_difference) > Decimal("0.02")
-                                        and not r.extra_tax_inferred):
-            r.warnings.append("No se pudo conciliar el cargo de servicios adicionales "
-                              "con el total de Paraty; revisar antes de calcular el depósito.")
+        elif any(len(room.night_rates) != r.nights for room in r.rooms):
+            r.warnings.append("No se puede calcular el depósito: el desglose "
+                              "por habitación y noches está incompleto.")
         else:
-            charge_for_services = r.services_total
-            if r.additional_services and r.extra_tax_inferred:
-                # La diferencia sobre el subtotal de servicios coincide con
-                # el impuesto de esos servicios; se cobra en la primera noche.
-                charge_for_services += r.extra_difference
-            room_amount = r.total - charge_for_services
-            if room_amount < 0:
-                r.warnings.append("El cargo de servicios supera el total de la "
-                                  "reservación; revisar importes.")
+            charge_for_services = r.services_with_tax
+            # Sin extras prorratear el total *oficial* del correo como antes.
+            # Con extras, prorratear únicamente el subtotal de las habitaciones,
+            # evitando incluir servicios + IVA en cada noche y cobrarlos dos veces.
+            room_amount = r.room_total if r.additional_services else r.total
+            if room_amount <= 0:
+                r.warnings.append("El subtotal de alojamiento no es válido; "
+                                  "revisar importes antes de cobrar.")
             else:
                 r.deposit_base_amount = room_amount
                 r.deposit_room_average = (
@@ -302,9 +314,7 @@ def parse_paraty_eml(data: bytes) -> Booking:
                     r.deposit_room_average + charge_for_services
                 ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                 r.deposit_tax_included_verified = (
-                    not r.additional_services or
-                    abs(r.extra_difference) <= Decimal("0.02") or
-                    r.extra_tax_inferred
+                    not r.additional_services or r.services_tax_reconciled
                 )
 
     # Beneficios: lista bajo el bloque de Comments (no añadir políticas como beneficios).
@@ -331,8 +341,12 @@ def parse_paraty_eml(data: bytes) -> Booking:
     if not r.checkin or not r.checkout: r.warnings.append("Faltan fechas")
     if r.night_rates and not r.additional_services and abs(r.room_total - r.total) > Decimal("0.02"):
         r.warnings.append("La suma de tarifas por noche no coincide con el importe total")
-    elif r.night_rates and r.additional_services and abs(r.extra_difference) > Decimal("0.02") and not r.extra_tax_inferred:
-        r.warnings.append("El total de habitación más servicios no concilia exactamente con el total Paraty; revisar diferencia antes de generar el Word")
+    elif r.night_rates and r.additional_services and abs(r.extra_difference) > Decimal("0.02"):
+        r.warnings.append(
+            "El total de Paraty no coincide con habitaciones + servicios + IVA 16% "
+            f"(diferencia: {fmt_usd(r.extra_difference)}). Revisar antes de cobrar: "
+            "la diferencia no se agrega automáticamente al depósito."
+        )
     if r.nights:
         for room in r.rooms:
             if len(room.night_rates) != r.nights:
@@ -468,7 +482,7 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
             para(q, fmt_usd(r.deposit_required), True, color=(200, 30, 30), size=10)
             q = left.add_paragraph()
             para(q, "Alojamiento: " + fmt_usd(r.deposit_room_average) +
-                 " + suplementos: " + fmt_usd(r.deposit_services_charge), size=8)
+                 " + suplementos (IVA 16%): " + fmt_usd(r.deposit_services_charge), size=8)
         if card_type == "American Express" and tc is not None:
             mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             q = left.add_paragraph()
@@ -541,7 +555,7 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
             para(p, fmt_usd(r.deposit_required), True, color=(200, 30, 30), size=10)
             p = d.add_paragraph()
             para(p, "Alojamiento: " + fmt_usd(r.deposit_room_average) +
-                 " + suplementos: " + fmt_usd(r.deposit_services_charge), size=8)
+                 " + suplementos (IVA 16%): " + fmt_usd(r.deposit_services_charge), size=8)
         if card_type == "American Express" and tc is not None:
             mxn = (r.total * tc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             p = d.add_paragraph()
@@ -584,12 +598,12 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
             p = d.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
             para(p, "DEPÓSITO FLEXIBLE: " + fmt_usd(r.deposit_required) +
-                 f"  (total alojamiento / {r.nights} noches + suplementos)", True,
+                 f"  (alojamiento / {r.nights} noches + servicios con IVA 16%)", True,
                  color=(30, 75, 130), size=9)
             q = d.add_paragraph()
             q.alignment = WD_ALIGN_PARAGRAPH.RIGHT
             para(q, "Promedio alojamiento: " + fmt_usd(r.deposit_room_average) +
-                 " | Servicios al primer cargo: " + fmt_usd(r.deposit_services_charge),
+                 " | Servicios + IVA 16% al primer cargo: " + fmt_usd(r.deposit_services_charge),
                  size=8)
 
     if r.additional_services:
@@ -606,15 +620,19 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
             for cell, content in zip(cells, [item.name, str(item.quantity), item.date, f"{item.price:,.2f} {item.currency}"]):
                 para(cell.paragraphs[0], content, size=8)
         p = d.add_paragraph()
-        para(p, "Subtotal servicios: ", True)
-        para(p, fmt_usd(r.services_total))
+        para(p, "Subtotal servicios (antes de IVA): ", True, size=8)
+        para(p, fmt_usd(r.services_total), size=8)
+        p = d.add_paragraph()
+        para(p, "IVA 16% servicios: ", True, size=8)
+        para(p, fmt_usd(r.services_tax), size=8)
+        p = d.add_paragraph()
+        para(p, "Total servicios con IVA (al primer cargo): ", True, size=8)
+        para(p, fmt_usd(r.services_with_tax), size=8)
         if abs(r.extra_difference) > Decimal("0.02"):
             p = d.add_paragraph()
-            description = "Impuestos adicionales sobre servicios (inferidos por conciliación): " if r.extra_tax_inferred else "Diferencia por conciliar con el total Paraty: "
-            para(p, description, True, color=(160, 75, 0), size=8)
+            para(p, "Diferencia con el total Paraty (revisar, NO se añade al depósito): ",
+                 True, color=(160, 75, 0), size=8)
             para(p, fmt_usd(r.extra_difference), color=(160, 75, 0), size=8)
-            if r.extra_tax_inferred:
-                para(d.add_paragraph(), "El correo no desglosa por separado el impuesto del servicio; importe calculado usando la tasa indicada en Paraty.", size=7)
         p = d.add_paragraph()
         para(p, "Total oficial Paraty: ", True)
         para(p, fmt_usd(r.total), True)
@@ -720,15 +738,14 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
         )
         diff_html = ""
         if abs(r.extra_difference) > Decimal("0.02"):
-            label = ("Impuestos adicionales sobre servicios (inferidos por conciliación)" if
-                     r.extra_tax_inferred else "Diferencia por conciliar con el total Paraty")
-            diff_html = f'<p class="note"><b>{h(label)}:</b> {p_text(fmt_usd(r.extra_difference))}</p>'
-            if r.extra_tax_inferred:
-                diff_html += '<p class="small">Paraty no desglosa este impuesto por servicio; se infiere de la tasa indicada.</p>'
+            diff_html = ('<p class="note"><b>Diferencia con el total Paraty (revisar, NO se añade al depósito):</b> '
+                         f'{p_text(fmt_usd(r.extra_difference))}</p>')
         services_html = f"""<h3>ADDITIONAL SERVICES / SERVICIOS ADICIONALES</h3>
         <table><thead><tr><th>Servicio</th><th>Cantidad</th><th>Fecha</th><th>Precio</th></tr></thead>
         <tbody>{rows}</tbody></table>
-        <p><b>Subtotal servicios:</b> {p_text(fmt_usd(r.services_total))}</p>
+        <p><b>Subtotal servicios (sin IVA):</b> {p_text(fmt_usd(r.services_total))}</p>
+        <p><b>IVA 16% servicios:</b> {p_text(fmt_usd(r.services_tax))}</p>
+        <p><b>Total servicios con IVA (al primer cargo):</b> {p_text(fmt_usd(r.services_with_tax))}</p>
         {diff_html}
         <p><b>Total oficial Paraty: {p_text(fmt_usd(r.total))}</b></p>"""
 
@@ -747,7 +764,7 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
     amount_html = f'''<p><b>Total price:</b> {p_text(fmt_usd(r.total))}</p>
      <p><b>Taxes per stay:</b> {p_text(fmt_usd(r.taxes))}</p>
      {f'<p><b>Total pendiente según Paraty (NO es el depósito):</b> {p_text(fmt_usd(r.pending))}</p>' if r.deposit_required is not None else f'<p class="red strong">Pending payment: {p_text(fmt_usd(r.pending))}</p>'}
-     {f'<p class="red strong"><b>DEPÓSITO FLEXIBLE (promedio noche + servicios): {p_text(fmt_usd(r.deposit_required))}</b></p><p class="small">Alojamiento: {p_text(fmt_usd(r.deposit_room_average))} + suplementos: {p_text(fmt_usd(r.deposit_services_charge))}</p>' if r.deposit_required is not None else ''}
+     {f'<p class="red strong"><b>DEPÓSITO FLEXIBLE (promedio alojamiento + servicios con IVA 16%): {p_text(fmt_usd(r.deposit_required))}</b></p><p class="small">Alojamiento: {p_text(fmt_usd(r.deposit_room_average))} + suplementos (IVA 16%): {p_text(fmt_usd(r.deposit_services_charge))}</p>' if r.deposit_required is not None else ''}
      {tc_html}'''
     nights_html = f'''<p>Number of Nights: {r.nights}</p>
      <p>Check-In Date: {p_text(fmt_date(r.checkin))}</p>
@@ -1005,25 +1022,28 @@ def main():
         st.write("**Subtotal todas las habitaciones:**", fmt_usd(booking.room_total))
     if booking.deposit_required is not None:
         st.success(f"DEPÓSITO FLEXIBLE — promedio de una noche de la reserva "
-                   f"({len(booking.rooms)} habitación(es)) + suplementos: "
+                   f"({len(booking.rooms)} habitación(es)) + suplementos (IVA 16%): "
                    f"{fmt_usd(booking.deposit_required)}")
         st.caption(f"Alojamiento a prorratear: {fmt_usd(booking.deposit_base_amount)} "
                    f"÷ {booking.nights} noches = {fmt_usd(booking.deposit_room_average)}; "
-                   f"suplementos completos al primer cargo (incluyendo impuestos "
-                   f"identificados): {fmt_usd(booking.deposit_services_charge)}. "
+                   f"servicios completos al primer cargo (IVA 16%): "
+                   f"{fmt_usd(booking.deposit_services_charge)}. "
                    "El total de Paraty ya incluye esos suplementos, por eso se "
                    "separan antes de prorratear para no cobrarlos dos veces.")
     if booking.additional_services:
         st.subheader("Additional Services / Servicios adicionales")
         st.dataframe([{"Servicio": x.name, "Cantidad": x.quantity, "Fecha": x.date,
-                       "Importe": f"{x.price:,.2f} {x.currency}"}
+                       "Base": f"{x.price:,.2f} {x.currency}",
+                       "IVA 16%": f"{(x.price * ADDITIONAL_SERVICES_TAX_RATE).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f} {x.currency}",
+                       "Total con IVA": f"{(x.price + (x.price * ADDITIONAL_SERVICES_TAX_RATE).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)):,.2f} {x.currency}"}
                       for x in booking.additional_services], hide_index=True, use_container_width=True)
-        st.write("**Subtotal servicios:**", fmt_usd(booking.services_total))
+        st.write("**Subtotal servicios (sin IVA):**", fmt_usd(booking.services_total))
+        st.write("**IVA de servicios (16%):**", fmt_usd(booking.services_tax))
+        st.write("**Servicios con IVA al depósito:**", fmt_usd(booking.services_with_tax))
         if abs(booking.extra_difference) > Decimal("0.02"):
-            if booking.extra_tax_inferred:
-                st.info(f"Diferencia calculada como impuesto sobre servicios: {fmt_usd(booking.extra_difference)}. Revisar contra Paraty; no aparece desglosada por servicio.")
-            else:
-                st.warning(f"Diferencia pendiente de conciliar: {fmt_usd(booking.extra_difference)}")
+            st.warning(f"El total Paraty difiere del desglose con IVA 16% por "
+                       f"{fmt_usd(booking.extra_difference)}. Revisar el importe: "
+                       "la diferencia no se suma automáticamente al depósito.")
         st.write("**Total oficial de la reservación:**", fmt_usd(booking.total))
     st.divider()
 
