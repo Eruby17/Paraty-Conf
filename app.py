@@ -1316,7 +1316,7 @@ def main():
         st.info(f"Tipo de cambio fijo configurado: {tc} MXN por USD "
                 "(editable en DEFAULT_EXCHANGE_RATE dentro de app.py).")
         st.success(f"Equivalente: MXN ${mxn:,.2f}")
-    last_four = st.text_input("Últimos cuatro dígitos (opcional)",
+    last_four = st.text_input("CVV AMEX)",
                               max_chars=4, key="last_four")
     bad_four = bool(last_four and (not last_four.isdigit() or len(last_four) != 4))
     if bad_four:
