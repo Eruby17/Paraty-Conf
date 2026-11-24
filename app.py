@@ -29,9 +29,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
 
-# Impuesto definido por el hotel para los servicios adicionales. No confundir
-# con la tasa de impuesto sobre el alojamiento que informa Paraty.
-ADDITIONAL_SERVICES_TAX_RATE = Decimal("0.16")  # Solo para compatibilidad/pruebas
+# Las tasas de impuesto de servicios se eligen individualmente en la interfaz.
 # EDITA ESTA LÍNEA para cambiar el tipo de cambio usado por American Express.
 DEFAULT_EXCHANGE_RATE = Decimal("18.20")
 
@@ -70,6 +68,18 @@ class AdditionalService:
     date: str
     price: Decimal
     currency: str = "USD"
+    tax_rate: Decimal | None = None  # Selección individual del operador
+
+    @property
+    def tax_amount(self) -> Decimal | None:
+        if self.tax_rate is None:
+            return None
+        return (self.price * self.tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    @property
+    def total_with_tax(self) -> Decimal | None:
+        tax = self.tax_amount
+        return (self.price + tax) if tax is not None else None
 
 
 @dataclass
@@ -111,9 +121,12 @@ class Booking:
     policy_reason: str = ""
     deposit_tax_included_verified: bool = False
     additional_services: list[AdditionalService] = field(default_factory=list)
+    services_section_present: bool = False
+    services_parse_error: bool = False
     room_total: Decimal = Decimal("0")
     services_total: Decimal = Decimal("0")  # Base de servicios antes de impuesto
-    services_tax_rate: Decimal | None = None  # Porcentaje elegido por el operador
+    services_tax_rate: Decimal | None = None  # Compatibilidad: tasa única si todas coinciden
+    services_tax_ready: bool = False  # Todos los servicios tienen tasa individual
     services_tax: Decimal = Decimal("0")
     services_with_tax: Decimal = Decimal("0")
     extra_difference: Decimal = Decimal("0")  # Total Paraty menos habitaciones y servicios con IVA
@@ -214,29 +227,34 @@ def policy_label(booking: Booking) -> str:
             "revisar": "REVISAR POLÍTICAS ANTES DEL COBRO"}.get(booking.policy_status, "Revisar")
 
 
+def rate_label(rate: Decimal | None) -> str:
+    """Presentación de porcentaje para cada servicio."""
+    if rate is None:
+        return "Pendiente"
+    value = format(rate * Decimal("100"), "f")
+    return f"{value.rstrip('0').rstrip('.') if '.' in value else value}%"
+
+
 def tax_percent_label(r: Booking) -> str:
-    """Etiqueta humana para la tasa elegida (p.ej. 16% o 30%)."""
-    if r.services_tax_rate is None:
+    """Resumen de tasas: homogéneas o distintas por cada suplemento."""
+    if not r.additional_services or not r.services_tax_ready:
         return "sin seleccionar"
-    value = format(r.services_tax_rate * Decimal("100"), "f")
-    if "." in value:
-        value = value.rstrip("0").rstrip(".")
-    return f"{value}%"
+    rates = {item.tax_rate for item in r.additional_services}
+    return rate_label(next(iter(rates))) if len(rates) == 1 else "individuales"
 
 
 def deposit_service_label(r: Booking) -> str:
-    """Texto apropiado tanto con suplementos como sin ellos."""
-    return (f"servicios con impuesto {tax_percent_label(r)}"
-            if r.additional_services else "sin servicios adicionales")
+    return "servicios con impuestos individuales" if r.additional_services else "sin servicios adicionales"
 
 
-def recalculate_booking_finances(r: Booking, service_tax_rate: Decimal | None) -> None:
-    """Recalcula servicio/impuestos y depósito a partir de una tasa ELEGIDA.
+def recalculate_booking_finances(
+    r: Booking, service_tax_rates: list[Decimal | None] | None = None
+) -> None:
+    """Calcula cada impuesto por separado y suma los servicios al primer cargo.
 
-    La tarifa nocturna de cada habitación ya incluye los impuestos de Paraty.
-    El servicio figura con precio base; el impuesto seleccionado se aplica una
-    sola vez. No se modifica el total oficial de Paraty ni se cobran diferencias
-    no conciliadas automáticamente.
+    Los importes de la tabla de habitaciones están ya en USD con impuestos
+    incluidos. Los precios de los servicios se consideran importes base.
+    No se modifica el total oficial Paraty ni se carga una diferencia pendiente.
     """
     r.warnings = [w for w in r.warnings
                   if not w.startswith(("IMPUESTOS SERVICIOS:", "DEPÓSITO:"))]
@@ -249,22 +267,31 @@ def recalculate_booking_finances(r: Booking, service_tax_rate: Decimal | None) -
     r.services_with_tax = Decimal("0")
     r.extra_difference = Decimal("0")
     r.services_tax_reconciled = False
-    r.services_tax_rate = service_tax_rate if r.additional_services else None
+    r.services_tax_rate = None
+    r.services_tax_ready = not bool(r.additional_services)
 
     if r.additional_services:
-        if service_tax_rate is None:
-            r.warnings.append("IMPUESTOS SERVICIOS: selecciona el impuesto aplicable "
-                              "(16%, 30% u otro) antes de generar la confirmación.")
+        if service_tax_rates is None:
+            service_tax_rates = [item.tax_rate for item in r.additional_services]
+        if len(service_tax_rates) != len(r.additional_services):
+            raise ValueError("Debe haber una selección de impuesto para cada servicio adicional.")
+        for item, rate in zip(r.additional_services, service_tax_rates):
+            if rate is not None and not Decimal("0") <= rate <= Decimal("1"):
+                raise ValueError(f"Impuesto no válido para el servicio {item.name}: {rate}")
+            item.tax_rate = rate
+        missing = [f"{i + 1}. {item.name}" for i, item in enumerate(r.additional_services)
+                   if item.tax_rate is None]
+        if missing:
+            r.warnings.append("IMPUESTOS SERVICIOS: elige un porcentaje para cada servicio antes "
+                              "de descargar o imprimir. Pendientes: " + ", ".join(missing))
             return
-        if not Decimal("0") <= service_tax_rate <= Decimal("1"):
-            raise ValueError("La tasa de impuesto de servicios debe estar entre 0% y 100%.")
-        # Redondeo por servicio (tal como se presenta en el documento).
-        r.services_tax = sum(
-            ((item.price * service_tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-             for item in r.additional_services), Decimal("0")
-        )
+        r.services_tax_ready = True
+        rates = {item.tax_rate for item in r.additional_services}
+        if len(rates) == 1:
+            r.services_tax_rate = next(iter(rates))
+        r.services_tax = sum((item.tax_amount for item in r.additional_services), Decimal("0"))
         r.services_with_tax = r.services_total + r.services_tax
-        if r.night_rates:
+        if r.rooms:
             r.extra_difference = (r.total - r.room_total - r.services_with_tax).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
@@ -272,10 +299,9 @@ def recalculate_booking_finances(r: Booking, service_tax_rate: Decimal | None) -
             if not r.services_tax_reconciled:
                 r.warnings.append(
                     "IMPUESTOS SERVICIOS: el total de Paraty no coincide con "
-                    f"habitaciones + suplementos + impuesto {tax_percent_label(r)} "
+                    "habitaciones + servicios con los impuestos individuales elegidos "
                     f"(diferencia: {fmt_usd(r.extra_difference)}). "
-                    "Verifica los importes antes de cobrar; la diferencia no "
-                    "se añade automáticamente al depósito."
+                    "Revisa los importes antes de cobrar; la diferencia NO se añade al depósito."
                 )
 
     if not r.flexible_rate:
@@ -287,9 +313,9 @@ def recalculate_booking_finances(r: Booking, service_tax_rate: Decimal | None) -
     elif any(len(room.night_rates) != r.nights for room in r.rooms):
         r.warnings.append("DEPÓSITO: falta un desglose completo por habitación y noche.")
     else:
-        # Con suplementos: prorratear solo habitaciones y añadir el servicio con
-        # el impuesto elegido completo al primer cargo. Sin suplementos: prorratear
-        # el importe total oficial, tal como se hacía anteriormente.
+        # Total de alojamiento / noches (todas las habitaciones) + todos los
+        # servicios con sus respectivas tasas. No duplicar suplementos que ya
+        # están incluidos en el total oficial de la reservación.
         room_amount = r.room_total if r.additional_services else r.total
         if room_amount <= 0:
             r.warnings.append("DEPÓSITO: el subtotal de alojamiento no es válido.")
@@ -302,7 +328,9 @@ def recalculate_booking_finances(r: Booking, service_tax_rate: Decimal | None) -
         r.deposit_required = (r.deposit_room_average + r.deposit_services_charge).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
-        r.deposit_tax_included_verified = (not r.additional_services or r.services_tax_reconciled)
+        r.deposit_tax_included_verified = (
+            not r.additional_services or r.services_tax_reconciled
+        )
 
 
 def parse_paraty_eml(data: bytes) -> Booking:
@@ -396,7 +424,16 @@ def parse_paraty_eml(data: bytes) -> Booking:
     # Paraty añade estos servicios fuera de la tabla de tarifas por noche.
     # "Price" es el importe mostrado para la línea, no se vuelve a multiplicar
     # por Quantity porque el correo no afirma que sea tarifa unitaria.
-    for element in soup.select(".additional_service_element"):
+    r.services_section_present = any(
+        re.search(r"\badditional\s+services\b", heading.get_text(" ", strip=True), re.I)
+        for heading in soup.find_all(["h2", "h3", "h4"])
+    )
+    service_elements = soup.find_all(
+        lambda tag: getattr(tag, "name", None) in ("div", "section", "li")
+        and any("additional_service_element" in str(cl).lower()
+                for cl in tag.get("class", []))
+    )
+    for element in service_elements:
         name_el = element.select_one("div > b")
         name = name_el.get_text(" ", strip=True) if name_el else ""
         content = re.sub(r"\s+", " ", element.get_text(" ", strip=True))
@@ -421,6 +458,13 @@ def parse_paraty_eml(data: bytes) -> Booking:
             currency=currency,
         ))
 
+    if r.services_section_present and not r.additional_services:
+        r.services_parse_error = True
+        r.warnings.append(
+            "SERVICIOS ADICIONALES: el correo contiene la sección Additional Services, "
+            "pero no se pudieron identificar los servicios. Revisa el correo y "
+            "no generes el documento hasta corregir la extracción."
+        )
     r.room_total = sum((room.total for room in r.rooms), Decimal("0"))
     r.services_total = sum((x.price for x in r.additional_services), Decimal("0"))
 
@@ -454,9 +498,9 @@ def parse_paraty_eml(data: bytes) -> Booking:
         r.warnings.append("POLÍTICA POR REVISAR: " + r.policy_reason +
                           " No se calcula ni recomienda un depósito automático.")
 
-    # Recálculo inicial con la tasa heredada. En Streamlit se vuelve a calcular
-    # con el porcentaje que el operador elija para los servicios adicionales.
-    recalculate_booking_finances(r, ADDITIONAL_SERVICES_TAX_RATE)
+    # Los impuestos adicionales nunca se eligen automáticamente.
+    # Cada servicio requiere selección manual antes de generar el Word.
+    recalculate_booking_finances(r)
 
     # Beneficios: lista bajo el bloque de Comments (no añadir políticas como beneficios).
     for ul in soup.find_all("ul"):
@@ -534,6 +578,8 @@ def prepare_masked_image(image_bytes: bytes) -> bytes:
 
 def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str = "",
                   inssist_number: str = "", payment_image: bytes | None = None) -> bytes:
+    if r.additional_services and not r.services_tax_ready:
+        raise ValueError("Falta seleccionar el impuesto de uno o más servicios adicionales.")
     d = Document()
     section = d.sections[0]
     section.page_width, section.page_height = Inches(8.5), Inches(11)
@@ -734,24 +780,29 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
     if r.additional_services:
         p = d.add_paragraph()
         para(p, "ADDITIONAL SERVICES / SERVICIOS ADICIONALES", True, size=10)
-        tab_services = d.add_table(rows=1, cols=4)
+        tab_services = d.add_table(rows=1, cols=6)
         tab_services.style = "Table Grid"
         tab_services.alignment = WD_TABLE_ALIGNMENT.CENTER
-        for cell, title in zip(tab_services.rows[0].cells, ["Servicio", "Cantidad", "Fecha", "Precio"]):
+        for cell, title in zip(tab_services.rows[0].cells,
+                               ["Servicio", "Cant.", "Fecha", "Base", "Imp.", "Total"]):
             set_cell_shading(cell, "2261A8")
-            para(cell.paragraphs[0], title, True, color=(255, 255, 255), size=8)
+            para(cell.paragraphs[0], title, True, color=(255, 255, 255), size=7)
         for item in r.additional_services:
             cells = tab_services.add_row().cells
-            for cell, content in zip(cells, [item.name, str(item.quantity), item.date, f"{item.price:,.2f} {item.currency}"]):
-                para(cell.paragraphs[0], content, size=8)
+            values = [item.name, str(item.quantity), item.date,
+                      f"{item.price:,.2f}",
+                      f"{rate_label(item.tax_rate)} / {item.tax_amount:,.2f}",
+                      f"{item.total_with_tax:,.2f} {item.currency}"]
+            for cell, content in zip(cells, values):
+                para(cell.paragraphs[0], content, size=7)
         p = d.add_paragraph()
-        para(p, "Subtotal servicios (antes de IVA): ", True, size=8)
+        para(p, "Subtotal servicios (antes de impuestos): ", True, size=8)
         para(p, fmt_usd(r.services_total), size=8)
         p = d.add_paragraph()
-        para(p, f"Impuesto {tax_percent_label(r)} de servicios: ", True, size=8)
+        para(p, "Suma de impuestos individuales de servicios: ", True, size=8)
         para(p, fmt_usd(r.services_tax), size=8)
         p = d.add_paragraph()
-        para(p, "Total servicios con IVA (al primer cargo): ", True, size=8)
+        para(p, "Total servicios con impuestos (al primer cargo): ", True, size=8)
         para(p, fmt_usd(r.services_with_tax), size=8)
         if abs(r.extra_difference) > Decimal("0.02"):
             p = d.add_paragraph()
@@ -815,6 +866,8 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
     Al pulsar el botón del visor se abre el diálogo de impresión del navegador.
     Se imprime solamente este HTML de la reservación, no la interfaz Streamlit.
     """
+    if r.additional_services and not r.services_tax_ready:
+        raise ValueError("Falta seleccionar el impuesto de uno o más servicios adicionales.")
     h = html_escape
     def p_text(s: object) -> str:
         return h(str(s), quote=True)
@@ -859,7 +912,9 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
     if r.additional_services:
         rows = "".join(
             f'<tr><td>{p_text(x.name)}</td><td>{x.quantity}</td><td>{p_text(x.date)}</td>'
-            f'<td>{p_text(f"{x.price:,.2f} {x.currency}")}</td></tr>'
+            f'<td>{p_text(f"{x.price:,.2f} {x.currency}")}</td>'
+            f'<td>{p_text(rate_label(x.tax_rate))} ({p_text(f"{x.tax_amount:,.2f}")})</td>'
+            f'<td>{p_text(f"{x.total_with_tax:,.2f} {x.currency}")}</td></tr>'
             for x in r.additional_services
         )
         diff_html = ""
@@ -867,11 +922,11 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
             diff_html = ('<p class="note"><b>Diferencia con el total Paraty (revisar, NO se añade al depósito):</b> '
                          f'{p_text(fmt_usd(r.extra_difference))}</p>')
         services_html = f"""<h3>ADDITIONAL SERVICES / SERVICIOS ADICIONALES</h3>
-        <table><thead><tr><th>Servicio</th><th>Cantidad</th><th>Fecha</th><th>Precio</th></tr></thead>
+        <table><thead><tr><th>Servicio</th><th>Cant.</th><th>Fecha</th><th>Base</th><th>Impuesto</th><th>Total</th></tr></thead>
         <tbody>{rows}</tbody></table>
-        <p><b>Subtotal servicios (sin IVA):</b> {p_text(fmt_usd(r.services_total))}</p>
-        <p><b>Impuesto {tax_percent_label(r)} servicios:</b> {p_text(fmt_usd(r.services_tax))}</p>
-        <p><b>Total servicios con IVA (al primer cargo):</b> {p_text(fmt_usd(r.services_with_tax))}</p>
+        <p><b>Subtotal servicios (sin impuestos):</b> {p_text(fmt_usd(r.services_total))}</p>
+        <p><b>Impuestos individuales de servicios:</b> {p_text(fmt_usd(r.services_tax))}</p>
+        <p><b>Total servicios con impuestos (al primer cargo):</b> {p_text(fmt_usd(r.services_with_tax))}</p>
         {diff_html}
         <p><b>Total oficial Paraty: {p_text(fmt_usd(r.total))}</b></p>"""
 
@@ -1122,40 +1177,61 @@ def main():
         st.session_state["insist_number"] = ""  # campo opcional por reservación
         st.session_state["card_type"] = "No identificado"
         st.session_state["last_four"] = ""
-        st.session_state["service_tax_choice"] = "Selecciona impuesto..."
-        st.session_state.pop("custom_service_tax", None)
+        # Evitar que las tasas de la reservación anterior se reutilicen.
+        for key in list(st.session_state):
+            if key.startswith(("service_rate_", "service_custom_rate_")):
+                del st.session_state[key]
     try:
         booking = parse_paraty_eml(mail_data)
     except Exception as exc:
         st.error(f"No se pudo interpretar este correo como confirmación Paraty: {exc}")
         st.stop()
 
-    # Preguntar impuesto SOLO cuando el correo trae Additional Services.
-    # No inferir automáticamente 16%/30% porque los correos varían.
+    # Impuestos individuales por cada servicio; lista dinámica sin límite fijo.
+    # Las claves contienen la fuente para separar reservaciones entre sí.
+    if booking.services_parse_error:
+        st.error("El correo contiene Additional Services, pero no se pudieron extraer. "
+                 "No generes un documento sin revisar los servicios de Paraty.")
     if booking.additional_services:
-        st.subheader("Impuestos de servicios adicionales")
-        tax_choice = st.selectbox(
-            "¿Qué porcentaje de impuesto se aplica a los servicios de esta reservación?",
-            ["Selecciona impuesto...", "16%", "30%", "Otro porcentaje"],
-            key="service_tax_choice",
-            help="Este impuesto se aplica a los servicios, NO a las habitaciones. "
-                 "Debes seleccionar uno antes de descargar o imprimir."
-        )
-        chosen_tax_rate = None
-        if tax_choice == "16%":
-            chosen_tax_rate = Decimal("0.16")
-        elif tax_choice == "30%":
-            chosen_tax_rate = Decimal("0.30")
-        elif tax_choice == "Otro porcentaje":
-            custom_tax = st.number_input(
-                "Impuesto personalizado (%)", min_value=0.0, max_value=100.0,
-                value=16.0, step=0.5, format="%.2f", key="custom_service_tax"
-            )
-            chosen_tax_rate = Decimal(str(custom_tax)) / Decimal("100")
-        recalculate_booking_finances(booking, chosen_tax_rate)
-        if chosen_tax_rate is not None:
-            st.info(f"Impuesto elegido para servicios: {tax_percent_label(booking)}. "
-                    "Se aplicará al depósito y al Word.")
+        st.subheader(f"Impuestos de servicios adicionales ({len(booking.additional_services)})")
+        st.caption("Selecciona el porcentaje de CADA servicio. Puede ser distinto "
+                   "para cada uno; ninguno se selecciona automáticamente.")
+        individual_rates = []
+        for i, service in enumerate(booking.additional_services):
+            with st.container(border=True):
+                st.markdown(f"**Servicio {i+1}: {service.name}**")
+                st.caption(f"Cantidad: {service.quantity}  |  Fecha: {service.date or 'Sin fecha'}"
+                           f"  |  Base: {service.price:,.2f} {service.currency}")
+                tax_choice = st.selectbox(
+                    f"Impuesto para {service.name} (servicio {i+1})",
+                    ["Selecciona impuesto...", "16%", "30%", "0%", "Otro porcentaje"],
+                    key=f"service_rate_{source_key}_{i}",
+                    help="Se aplica solo al servicio mostrado, no a toda la reserva."
+                )
+                chosen_rate = None
+                if tax_choice in ("16%", "30%", "0%"):
+                    chosen_rate = Decimal(tax_choice[:-1]) / Decimal("100")
+                elif tax_choice == "Otro porcentaje":
+                    custom = st.number_input(
+                        f"Impuesto personalizado para {service.name} (%)",
+                        min_value=0.0, max_value=100.0, value=16.0,
+                        step=0.5, format="%.2f",
+                        key=f"service_custom_rate_{source_key}_{i}"
+                    )
+                    chosen_rate = Decimal(str(custom)) / Decimal("100")
+                individual_rates.append(chosen_rate)
+                if chosen_rate is not None:
+                    tax = (service.price * chosen_rate).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                    st.caption(f"Impuesto: {tax:,.2f} {service.currency}  |  "
+                               f"Total de este servicio: {service.price + tax:,.2f} {service.currency}")
+                else:
+                    st.caption("Pendiente: selecciona el impuesto de este servicio.")
+        recalculate_booking_finances(booking, individual_rates)
+        if booking.services_tax_ready:
+            st.success("Impuestos individuales completos. Los totales están listos para revisar.")
+
 
     if booking.warnings:
         for warning in booking.warnings:
@@ -1197,23 +1273,29 @@ def main():
                    "separan antes de prorratear para no cobrarlos dos veces.")
     if booking.additional_services:
         st.subheader("Additional Services / Servicios adicionales")
-        if booking.services_tax_rate is not None:
-            st.dataframe([{"Servicio": x.name, "Cantidad": x.quantity, "Fecha": x.date,
-                           "Base": f"{x.price:,.2f} {x.currency}",
-                           f"Impuesto {tax_percent_label(booking)}":
-                               f"{(x.price * booking.services_tax_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f} {x.currency}",
-                           "Total con impuesto":
-                               f"{(x.price + (x.price * booking.services_tax_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)):,.2f} {x.currency}"}
-                          for x in booking.additional_services], hide_index=True, use_container_width=True)
-            st.write("**Subtotal servicios (sin impuestos):**", fmt_usd(booking.services_total))
-            st.write(f"**Impuesto sobre servicios ({tax_percent_label(booking)}):**", fmt_usd(booking.services_tax))
-            st.write("**Servicios con impuesto al depósito:**", fmt_usd(booking.services_with_tax))
+        st.dataframe([
+            {
+                "Servicio": x.name, "Cantidad": x.quantity, "Fecha": x.date,
+                "Base": f"{x.price:,.2f} {x.currency}",
+                "Impuesto (%)": rate_label(x.tax_rate),
+                "Impuesto ($)": (f"{x.tax_amount:,.2f} {x.currency}"
+                                  if x.tax_amount is not None else "Pendiente"),
+                "Total con impuesto": (f"{x.total_with_tax:,.2f} {x.currency}"
+                                       if x.total_with_tax is not None else "Pendiente")
+            }
+            for x in booking.additional_services
+        ], hide_index=True, use_container_width=True)
+        st.write("**Subtotal servicios (sin impuestos):**", fmt_usd(booking.services_total))
+        if booking.services_tax_ready:
+            st.write("**Suma de impuestos individuales:**", fmt_usd(booking.services_tax))
+            st.write("**Servicios con impuestos al depósito:**", fmt_usd(booking.services_with_tax))
             if abs(booking.extra_difference) > Decimal("0.02"):
-                st.warning(f"El total Paraty difiere del desglose con impuesto "
-                           f"{tax_percent_label(booking)} por {fmt_usd(booking.extra_difference)}. "
-                           "Revisar el importe; la diferencia no se suma automáticamente al depósito.")
+                st.warning(f"El total Paraty difiere del desglose con las tasas individuales "
+                           f"por {fmt_usd(booking.extra_difference)}. Revisar el importe; "
+                           "la diferencia no se suma automáticamente al depósito.")
         else:
-            st.info("Selecciona el impuesto para ver el importe total de cada servicio.")
+            st.info("Selecciona el impuesto de TODOS los servicios para ver el importe "
+                    "final y habilitar Word e impresión.")
         st.write("**Total oficial de la reservación:**", fmt_usd(booking.total))
     st.divider()
 
@@ -1286,7 +1368,8 @@ def main():
     disabled = ((card_type == "American Express" and tc is None) or bad_four or
                 (bool(payment_image) and not acknowledge) or
                 (booking.flexible_rate and booking.deposit_required is None) or
-                (bool(booking.additional_services) and booking.services_tax_rate is None))
+                booking.services_parse_error or
+                (bool(booking.additional_services) and not booking.services_tax_ready))
     if not disabled:
         try:
             output = generate_docx(booking, card_type, tc, last_four,
