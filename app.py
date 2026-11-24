@@ -687,7 +687,8 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
     if payment_image:
         # Cuadro máximo 7 x 10 cm. Mantener proporciones; no estirar el recorte.
         p_img = right.paragraphs[0]
-        p_img.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        # Centrar la imagen y los cuatro dígitos en el mismo eje vertical.
+        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p_img.paragraph_format.space_after = Pt(0)
         with Image.open(BytesIO(payment_image)) as img:
             ratio = min(7.0 / img.width, 10.0 / img.height)
@@ -695,14 +696,18 @@ def generate_docx(r: Booking, card_type: str, tc: Decimal | None, last_four: str
             height_cm = img.height * ratio
         p_img.add_run().add_picture(BytesIO(payment_image),
                                     width=Cm(width_cm), height=Cm(height_cm))
-    if card_type != "No identificado":
-        q = right.add_paragraph()
-        q.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        para(q, "Tipo: " + card_type, size=8)
+    # Los 4 dígitos de referencia se imprimen sin texto ni asteriscos,
+    # inmediatamente debajo de la imagen cuando exista, en fuente 12 pt.
     if last_four:
         q = right.add_paragraph()
-        q.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        para(q, "Terminación: " + last_four, size=8)
+        q.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        q.paragraph_format.space_before = Pt(3 if payment_image else 0)
+        q.paragraph_format.space_after = Pt(2)
+        para(q, last_four, size=12)
+    if card_type != "No identificado":
+        q = right.add_paragraph()
+        q.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        para(q, "Tipo: " + card_type, size=8)
 
     d.add_paragraph("_________________________________________________________________________________")
     if not payment_image:
@@ -878,12 +883,12 @@ def generate_print_html(r: Booking, card_type: str, tc: Decimal | None,
         encoded = base64.b64encode(payment_image).decode("ascii")
         img_html = (f'<img alt="Imagen de referencia enmascarada" '
                     f'src="data:image/png;base64,{encoded}" '
-                    f'style="display:block;max-width:7cm;max-height:10cm;width:auto;height:auto;margin-left:auto" />')
+                    f'style="display:block;max-width:7cm;max-height:10cm;width:auto;height:auto;margin:0 auto" />')
     payment_label = ""
+    if last_four:
+        payment_label += f'<p class="card-reference-digits">{p_text(last_four)}</p>'
     if card_type != "No identificado":
         payment_label += pair("Tipo", card_type)
-    if last_four:
-        payment_label += pair("Terminación", last_four)
     image_column = f'<div class="payment-image">{img_html}{payment_label}</div>'
 
     room_rates_html = ""
@@ -976,7 +981,8 @@ button:hover {{ background:#0d3f83; }}
 .instructions {{ font-size:12px; margin-left:10px; color:#596273; }}
 .paper {{ max-width: 21.6cm; margin:0 auto; padding: .53in .55in .55in .55in; }}
 .top {{ display:grid; grid-template-columns:minmax(0,1fr) 7.5cm; column-gap:.15cm; align-items:start; }}
-.payment-image {{ text-align:right; padding:0; margin:0; background:transparent; border:0; }}
+.payment-image {{ text-align:center; padding:0; margin:0; background:transparent; border:0; }}
+.card-reference-digits {{ text-align:center; font-size:12pt; line-height:1.2; margin:3pt 0 2pt; }}
 h2 {{ font-size:14pt; font-weight:normal; margin:5px 0; }}
 h3 {{ font-size:10pt; margin:12px 0 5px; break-after:avoid; }}
 p {{ margin:4px 0; }}
@@ -1316,7 +1322,9 @@ def main():
         st.info(f"Tipo de cambio fijo configurado: {tc} MXN por USD "
                 "(editable en DEFAULT_EXCHANGE_RATE dentro de app.py).")
         st.success(f"Equivalente: MXN ${mxn:,.2f}")
-    last_four = st.text_input("CVV)",
+    st.caption("CVV: los cuatro dígitos de seguridad de American Express se consultan "
+               "en Paraty Manager. Este programa no los solicita ni los guarda.")
+    last_four = st.text_input("4 dígitos de referencia de la tarjeta (NO el CVV; opcional)",
                               max_chars=4, key="last_four")
     bad_four = bool(last_four and (not last_four.isdigit() or len(last_four) != 4))
     if bad_four:
