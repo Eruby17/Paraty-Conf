@@ -31,7 +31,7 @@ from docx.shared import Cm, Inches, Pt, RGBColor
 
 # Las tasas de impuesto de servicios se eligen individualmente en la interfaz.
 # EDITA ESTA LÍNEA para cambiar el tipo de cambio usado por American Express.
-DEFAULT_EXCHANGE_RATE = Decimal("18.20")
+DEFAULT_EXCHANGE_RATE = Decimal("19.30")
 
 
 @dataclass
